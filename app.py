@@ -4,31 +4,55 @@ import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+from src.csv_flatten import flatten_csv
 from src.ollama_client import is_running, list_models
 from src.pipeline import Pipeline
 from src.sysmon import SystemMonitor
 
+# Optional drag-and-drop support via tkinterdnd2. If missing, app still
+# works — user must use the "Thêm file..." button as before.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+
+_IMG_GLOB = "*.png *.jpg *.jpeg *.webp *.gif *.bmp *.tif *.tiff"
 SUPPORTED_FILETYPES = [
+    ("Tất cả hỗ trợ", f"*.pdf *.docx *.doc *.txt *.md {_IMG_GLOB}"),
     ("Documents", "*.pdf *.docx *.doc *.txt *.md"),
+    ("Ảnh", _IMG_GLOB),
     ("PDF", "*.pdf"),
     ("Word", "*.docx *.doc"),
     ("Text", "*.txt *.md"),
     ("All files", "*.*"),
 ]
 
+DOC_EXTS = {".pdf", ".docx", ".doc", ".txt", ".md"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+SUPPORTED_EXTS = DOC_EXTS | IMAGE_EXTS
+
 PREFERRED_MODELS = (
-    "qwen3.5:9b", "llama3.1:8b", "deepseek-r1:8b",
-    "deepseek-r1:14b", "gemma4:e4b",
+    "llama3.1:8b", "gemma4:e4b", "qwen3.5:9b",
+    "deepseek-r1:8b", "deepseek-r1:14b",
+)
+
+# Heuristic nhận diện model nhìn được ảnh (dựa trên tên) để tự gợi ý.
+VISION_HINTS = (
+    "llava", "vision", "minicpm-v", "moondream", "bakllava", "pixtral",
+    "qwen2-vl", "qwen2.5vl", "qwen2.5-vl", "qwen3-vl", "qwen3vl",
+    "gemma3", "llama3.2-vision", "llama4", "granite3.2-vision",
 )
 
 INSTRUCTION_PLACEHOLDER = (
-    "Ví dụ: Tóm tắt đoạn văn sau bằng tiếng Việt trong 3-5 câu.\n"
-    "Hoặc: Trích xuất tất cả định nghĩa thuật ngữ theo dạng 'Thuật ngữ: định nghĩa'.\n"
-    "(Để TRỐNG = chế độ auto Q&A, model tự sinh nhiều cặp hỏi-đáp mỗi chunk)"
+    'Ví dụ: Tóm tắt đoạn văn dưới dạng JSON {"summary": "...", "keywords": [...]}\n'
+    'Hoặc: Trích xuất Q&A: {"question": "...", "answer": "..."}\n'
+    "(Output LUÔN là JSON — Ollama format=json bắt buộc)"
 )
 
 
@@ -79,6 +103,8 @@ class App:
         self.sysmon = SystemMonitor()
         self._sysmon_job: Optional[str] = None
         self._placeholder_on = True
+        self._pending_logs: list[str] = []
+        self._log_flush_job: Optional[str] = None
 
         self._build_ui()
         self.refresh_models()
@@ -93,12 +119,17 @@ class App:
         main.pack(fill="both", expand=True)
 
         # ===== Section 1: Files =====
-        fbox = ttk.LabelFrame(main, text="  1. Files đầu vào (.pdf / .docx / .doc / .txt)  ")
+        dnd_hint = "  ·  kéo-thả file vào đây" if _DND_AVAILABLE else ""
+        fbox = ttk.LabelFrame(
+            main,
+            text=f"  1. Files đầu vào (.pdf / .docx / .doc / .txt / ảnh) — có thể thêm cả thư mục{dnd_hint}  ",
+        )
         fbox.pack(fill="x", pady=(0, 10))
 
         toolbar = ttk.Frame(fbox)
         toolbar.pack(fill="x", **pad)
         ttk.Button(toolbar, text="Thêm file...", command=self.add_files).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="Thêm thư mục...", command=self.add_folder).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="Xóa đã chọn", command=self.remove_selected).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="Xóa hết", command=self.clear_files).pack(side="left")
         self.lbl_count = ttk.Label(toolbar, text="0 file")
@@ -116,6 +147,16 @@ class App:
         self.lst_files.config(yscrollcommand=sb.set)
         self.lst_files.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+
+        # Đăng ký drop target cho listbox và toàn bộ cửa sổ
+        # (thả ở đâu cũng nhận, miễn là tkinterdnd2 sẵn sàng).
+        if _DND_AVAILABLE:
+            for w in (self.lst_files, self.root):
+                try:
+                    w.drop_target_register(DND_FILES)
+                    w.dnd_bind("<<Drop>>", self._on_drop_files)
+                except (tk.TclError, AttributeError):
+                    pass
 
         # ===== Section 2: Instruction =====
         ibox = ttk.LabelFrame(main, text="  2. Instruction (cùng dùng cho mỗi chunk → cột 'instruction')  ")
@@ -139,17 +180,40 @@ class App:
         self.txt_instr.bind("<FocusIn>", self._instr_focus_in)
         self.txt_instr.bind("<FocusOut>", self._instr_focus_out)
 
+        # Schema mẫu — ép Ollama dùng đúng keys cho MỌI chunk (Structured Outputs).
+        schema_frame = ttk.Frame(ibox)
+        schema_frame.pack(fill="x", **pad)
+        ttk.Label(
+            schema_frame,
+            text='Schema mẫu (khuyên dùng): JSON ví dụ — vd  {"bệnh":[], "triệu chứng":[]}',
+            foreground="#444",
+        ).pack(anchor="w")
+        self.var_schema = tk.StringVar(value='')
+        ttk.Entry(
+            schema_frame, textvariable=self.var_schema,
+            font=("Consolas", 10),
+        ).pack(fill="x", pady=(4, 0))
+
         # ===== Section 3: Config =====
         cbox = ttk.LabelFrame(main, text="  3. Cấu hình  ")
         cbox.pack(fill="x", pady=(0, 10))
 
         r1 = ttk.Frame(cbox); r1.pack(fill="x", **pad)
-        ttk.Label(r1, text="Model Ollama:").pack(side="left")
+        ttk.Label(r1, text="Model Ollama:", width=14).pack(side="left")
         self.cmb_model = ttk.Combobox(r1, state="readonly", width=28)
         self.cmb_model.pack(side="left", padx=8)
         ttk.Button(r1, text="↻ Refresh", command=self.refresh_models).pack(side="left")
         self.lbl_ollama = ttk.Label(r1, text="", foreground="gray")
         self.lbl_ollama.pack(side="left", padx=12)
+
+        rv = ttk.Frame(cbox); rv.pack(fill="x", **pad)
+        ttk.Label(rv, text="Model đọc ảnh:", width=14).pack(side="left")
+        self.cmb_vision = ttk.Combobox(rv, state="readonly", width=28)
+        self.cmb_vision.pack(side="left", padx=8)
+        ttk.Label(
+            rv, text="(vision/OCR — để trống nếu không xử lý ảnh)",
+            foreground="gray",
+        ).pack(side="left", padx=4)
 
         r2 = ttk.Frame(cbox); r2.pack(fill="x", **pad)
         ttk.Label(r2, text="Output CSV:").pack(side="left")
@@ -161,23 +225,28 @@ class App:
 
         r3 = ttk.Frame(cbox); r3.pack(fill="x", **pad)
         ttk.Label(r3, text="Chunk size (từ):").pack(side="left")
-        self.var_chunk = tk.IntVar(value=1500)
-        ttk.Spinbox(r3, from_=300, to=8000, increment=100,
+        self.var_chunk = tk.IntVar(value=200)
+        ttk.Spinbox(r3, from_=50, to=8000, increment=50,
                     textvariable=self.var_chunk, width=8).pack(side="left", padx=6)
 
-        ttk.Label(r3, text="Samples/chunk (auto):").pack(side="left", padx=(18, 0))
-        self.var_samples = tk.IntVar(value=3)
-        ttk.Spinbox(r3, from_=1, to=10, textvariable=self.var_samples, width=6).pack(side="left", padx=6)
+        ttk.Label(r3, text="num_predict:").pack(side="left", padx=(18, 0))
+        self.var_npredict = tk.IntVar(value=512)
+        ttk.Spinbox(r3, from_=32, to=4096, increment=32,
+                    textvariable=self.var_npredict, width=8).pack(side="left", padx=6)
 
         ttk.Label(r3, text="Temp:").pack(side="left", padx=(18, 0))
-        self.var_temp = tk.DoubleVar(value=0.3)
-        ttk.Spinbox(r3, from_=0.0, to=1.5, increment=0.1,
+        self.var_temp = tk.DoubleVar(value=0.1)
+        ttk.Spinbox(r3, from_=0.0, to=1.5, increment=0.05,
                     textvariable=self.var_temp, width=6, format="%.2f").pack(side="left", padx=6)
 
         ttk.Label(r3, text="num_ctx:").pack(side="left", padx=(18, 0))
-        self.var_ctx = tk.IntVar(value=8192)
+        self.var_ctx = tk.IntVar(value=4096)
         ttk.Spinbox(r3, from_=2048, to=32768, increment=1024,
                     textvariable=self.var_ctx, width=8).pack(side="left", padx=6)
+
+        ttk.Label(r3, text="keep_alive:").pack(side="left", padx=(18, 0))
+        self.var_keep = tk.StringVar(value="30m")
+        ttk.Entry(r3, textvariable=self.var_keep, width=6).pack(side="left", padx=6)
 
         # ===== Action buttons =====
         abox = ttk.Frame(main)
@@ -188,6 +257,9 @@ class App:
         self.btn_stop.pack(side="left", ipadx=4, ipady=2)
         ttk.Button(abox, text="📂  Mở thư mục output", command=self.open_output_dir).pack(
             side="right", ipadx=4, ipady=2
+        )
+        ttk.Button(abox, text="📁  Mở thư mục flat", command=self.open_flat_dir).pack(
+            side="right", padx=(0, 8), ipadx=4, ipady=2
         )
 
         # ===== Bottom split: Progress (left) + System monitor (right) =====
@@ -269,7 +341,7 @@ class App:
                 self.lbl_vram.config(text="n/a")
         except Exception:
             pass
-        self._sysmon_job = self.root.after(1000, self._schedule_sysmon)
+        self._sysmon_job = self.root.after(2000, self._schedule_sysmon)
 
     # ------------------------------------------------------------ placeholder
     def _instr_focus_in(self, _evt) -> None:
@@ -291,13 +363,82 @@ class App:
         return self.txt_instr.get("1.0", "end-1c").strip()
 
     # ------------------------------------------------------------ file ops
+    def _add_one(self, path_str: str) -> tuple[int, int]:
+        """Thêm một file (đã chắc là file). Trả về (added, skipped)."""
+        path = Path(path_str)
+        if path.suffix.lower() not in SUPPORTED_EXTS:
+            return 0, 1
+        s = str(path)
+        if s in self.files:
+            return 0, 0
+        self.files.append(s)
+        self.lst_files.insert("end", s)
+        return 1, 0
+
+    @staticmethod
+    def _iter_dir_files(root: str) -> list[str]:
+        """Duyệt đệ quy thư mục, trả về mọi file có đuôi hỗ trợ (đã sort)."""
+        out: list[str] = []
+        for dirpath, _dirs, names in os.walk(root):
+            for n in names:
+                p = Path(dirpath) / n
+                if p.suffix.lower() in SUPPORTED_EXTS:
+                    out.append(str(p))
+        return sorted(out)
+
+    def _add_paths(self, paths) -> tuple[int, int]:
+        """Lọc & thêm đường dẫn hợp lệ (file hoặc thư mục) vào self.files +
+        listbox. Thư mục được duyệt đệ quy. Trả về (thêm mới, bỏ qua)."""
+        added = skipped = 0
+        for raw in paths:
+            p = str(raw).strip().strip("{}").strip('"').strip("'")
+            if not p:
+                continue
+            path = Path(p)
+            if path.is_dir():
+                for fp in self._iter_dir_files(p):
+                    a, s = self._add_one(fp)
+                    added += a
+                    skipped += s
+            elif path.is_file():
+                a, s = self._add_one(p)
+                added += a
+                skipped += s
+            else:
+                skipped += 1
+        self.lbl_count.config(text=f"{len(self.files)} file")
+        return added, skipped
+
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(title="Chọn file", filetypes=SUPPORTED_FILETYPES)
-        for p in paths:
-            if p not in self.files:
-                self.files.append(p)
-                self.lst_files.insert("end", p)
-        self.lbl_count.config(text=f"{len(self.files)} file")
+        if paths:
+            self._add_paths(paths)
+
+    def add_folder(self) -> None:
+        d = filedialog.askdirectory(
+            title="Chọn thư mục (đọc tất cả file con, kể cả thư mục con)"
+        )
+        if not d:
+            return
+        added, skipped = self._add_paths([d])
+        msg = f"📁 Thêm thư mục: +{added} file"
+        if skipped:
+            msg += f" ({skipped} bỏ qua — không hỗ trợ)"
+        self.log(msg)
+
+    def _on_drop_files(self, event) -> None:
+        """Handler cho sự kiện <<Drop>> của tkinterdnd2.
+        event.data là chuỗi Tcl list, có thể chứa các path trong dấu {} khi có khoảng trắng."""
+        try:
+            raw_list = self.root.tk.splitlist(event.data)
+        except (tk.TclError, AttributeError):
+            raw_list = [event.data]
+        added, skipped = self._add_paths(raw_list)
+        if added or skipped:
+            msg = f"📥 Đã kéo-thả: +{added} file"
+            if skipped:
+                msg += f" ({skipped} bỏ qua — không hỗ trợ)"
+            self.log(msg)
 
     def remove_selected(self) -> None:
         for idx in reversed(self.lst_files.curselection()):
@@ -327,15 +468,58 @@ class App:
         except AttributeError:
             messagebox.showinfo("Output dir", str(out))
 
+    def open_flat_dir(self) -> None:
+        """Mở thư mục `<output>_flat` — nơi nút 'JSON → CSV phẳng' ghi kết quả."""
+        out_parent = Path(self.var_out.get()).parent
+        flat = out_parent.parent / f"{out_parent.name}_flat"
+        flat.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(flat))
+        except AttributeError:
+            messagebox.showinfo("Flat dir", str(flat))
+
+    def _auto_flatten(self, src_csv: str) -> None:
+        """Sau khi pipeline xong, tự động phẳng hoá file vừa ghi ra
+        <output_dir>_flat/<stem>_flat.csv (bao gồm explode array)."""
+        src = Path(src_csv)
+        if not src.exists():
+            return
+        dst_dir = src.parent.parent / f"{src.parent.name}_flat"
+        dst = dst_dir / f"{src.stem}_flat.csv"
+        self.log("")
+        self.log(f"📊 Tự động phẳng hoá → {dst}")
+        try:
+            flatten_csv(str(src), str(dst), on_log=self.log)
+        except Exception as e:
+            self.log(f"   ❌ Lỗi phẳng hoá: {e}")
+
+    @staticmethod
+    def _timestamped_path(path: str) -> str:
+        """Insert _YYYYMMDD_HHMMSS before extension so each run gets a unique file."""
+        p = Path(path)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = p.suffix or ".csv"
+        return str(p.with_name(f"{p.stem}_{ts}{suffix}"))
+
     # ------------------------------------------------------------- Ollama
     def refresh_models(self) -> None:
         if not is_running():
             self.lbl_ollama.config(text="⚠ Ollama không chạy (localhost:11434)", foreground="red")
             self.cmb_model["values"] = []
             self.cmb_model.set("")
+            self.cmb_vision["values"] = []
+            self.cmb_vision.set("")
             return
         models = list_models()
         self.cmb_model["values"] = models
+        # Vision: cho phép để trống + tự gợi ý model có vẻ nhìn được ảnh.
+        self.cmb_vision["values"] = [""] + models
+        vchosen = ""
+        for m in models:
+            if any(h in m.lower() for h in VISION_HINTS):
+                vchosen = m
+                break
+        self.cmb_vision.set(vchosen)
         if not models:
             self.cmb_model.set("")
             self.lbl_ollama.config(text="⚠ Chưa có model nào", foreground="orange")
@@ -349,14 +533,29 @@ class App:
         self.lbl_ollama.config(text=f"✓ {len(models)} model có sẵn", foreground="#0a8a3a")
 
     # ---------------------------------------------------- logging & progress
-    def _append_log(self, msg: str) -> None:
+    def _flush_logs(self) -> None:
+        self._log_flush_job = None
+        if not self._pending_logs:
+            return
+
         self.txt_log.config(state="normal")
-        self.txt_log.insert("end", msg + "\n")
+        for msg in self._pending_logs:
+            self.txt_log.insert("end", msg + "\n")
         self.txt_log.see("end")
         self.txt_log.config(state="disabled")
+        self._pending_logs.clear()
+
+        try:
+            line_count = int(self.txt_log.index("end-1c").split(".")[0])
+        except Exception:
+            return
+        if line_count > 400:
+            self.txt_log.delete("1.0", f"{line_count - 300}.0")
 
     def log(self, msg: str) -> None:
-        self.root.after(0, self._append_log, msg)
+        self._pending_logs.append(msg)
+        if self._log_flush_job is None:
+            self._log_flush_job = self.root.after(120, self._flush_logs)
 
     def update_progress(self, cur: int, total: int, eta: Optional[float] = None) -> None:
         def _apply():
@@ -382,21 +581,37 @@ class App:
         if not model:
             messagebox.showwarning("Thiếu model", "Vui lòng chọn model Ollama.")
             return
-        out = self.var_out.get().strip()
-        if not out:
+
+        vision_model = self.cmb_vision.get().strip()
+        has_image = any(Path(f).suffix.lower() in IMAGE_EXTS for f in self.files)
+        if has_image and not vision_model:
+            messagebox.showwarning(
+                "Thiếu model đọc ảnh",
+                "Danh sách có file ảnh nhưng bạn chưa chọn 'Model đọc ảnh' "
+                "(vision/OCR).\nHãy chọn một model nhìn được ảnh — vd: "
+                "llama3.2-vision, llava, minicpm-v, qwen2.5vl — rồi thử lại.",
+            )
+            return
+
+        out_template = self.var_out.get().strip()
+        if not out_template:
             messagebox.showwarning("Thiếu output", "Vui lòng chọn đường dẫn output CSV.")
             return
 
-        if Path(out).exists():
-            if not messagebox.askyesno(
-                "File đã tồn tại",
-                f"File '{Path(out).name}' đã có. Tiếp tục sẽ APPEND thêm dòng mới vào cuối file.\nTiếp tục?",
-            ):
-                return
-
         instruction = self._get_instruction()
-        mode = "Custom instruction" if instruction else "Auto Q&A"
-        self.log(f"\n=== Bắt đầu run | Mode: {mode} | Model: {model} ===")
+        if not instruction:
+            messagebox.showwarning(
+                "Thiếu instruction",
+                "Vui lòng nhập instruction. Output sẽ luôn là JSON nên cần mô tả task cụ thể.",
+            )
+            return
+
+        # Mỗi run tạo file mới với timestamp - tránh lock Excel/OneDrive
+        out = self._timestamped_path(out_template)
+        self.log(f"\n=== Bắt đầu run | Model: {model} ===")
+        if has_image:
+            self.log(f"🖼 Model đọc ảnh (OCR): {vision_model}")
+        self.log(f"📁 Output file: {out}")
 
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -410,9 +625,12 @@ class App:
             output_csv=out,
             instruction=instruction,
             chunk_words=int(self.var_chunk.get()),
-            samples_per_chunk=int(self.var_samples.get()),
             temperature=float(self.var_temp.get()),
             num_ctx=int(self.var_ctx.get()),
+            num_predict=int(self.var_npredict.get()),
+            keep_alive=self.var_keep.get().strip() or "30m",
+            vision_model=vision_model,
+            output_template=self.var_schema.get().strip(),
             on_log=self.log,
             on_progress=self.update_progress,
             on_status=self.update_status,
@@ -422,6 +640,9 @@ class App:
         def runner():
             try:
                 pipe.run()
+                # Auto-flatten ngay sau khi pipeline ghi xong CSV gốc
+                if not self.stop_flag:
+                    self._auto_flatten(out)
             except Exception as e:
                 self.log(f"❌ Lỗi không mong đợi: {e}")
             finally:
@@ -488,7 +709,8 @@ def _setup_style(root: tk.Tk) -> None:
 
 def main() -> None:
     enable_dpi_awareness()
-    root = tk.Tk()
+    # Dùng TkinterDnD.Tk() để nhận drop từ Explorer; fallback nếu lib chưa cài.
+    root = TkinterDnD.Tk() if _DND_AVAILABLE else tk.Tk()
     _setup_fonts()
     _setup_style(root)
     App(root)
