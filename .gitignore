@@ -12,6 +12,11 @@ output/
 # API keys — giữ providers.example.json, KHÔNG commit file thật
 providers.json
 
+# Runtime / throwaway artifacts
+*.log
+_*.py
+assets/_preview.png
+
 .idea/
 .vscode/
 .DS_Store
