@@ -1,11 +1,18 @@
 """Minimal Ollama HTTP client with optional token streaming."""
 import json
+import time
 from typing import Callable, Optional
 
 import requests
 
 DEFAULT_BASE = "http://localhost:11434"
 _SESSION = requests.Session()
+
+# Default retry policy for transient connection failures. A long run can issue
+# hundreds of calls; a single dropped connection should not abort the batch.
+_DEFAULT_MAX_RETRIES = 2
+_DEFAULT_RETRY_BACKOFF = 1.5
+_DEFAULT_CONNECT_TIMEOUT = 10.0
 
 
 def is_running(base_url: str = DEFAULT_BASE, timeout: float = 2.0) -> bool:
@@ -56,6 +63,9 @@ def generate(
     timeout: int = 600,
     on_token: Optional[Callable[[str, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+    retry_backoff: float = _DEFAULT_RETRY_BACKOFF,
+    connect_timeout: float = _DEFAULT_CONNECT_TIMEOUT,
 ) -> str:
     """Call /api/generate with streaming. Returns the full response text.
 
@@ -69,6 +79,8 @@ def generate(
     - json_schema: if provided, sent as `format=<schema>` (Ollama Structured
       Outputs, ≥ 0.5). Cứng hơn `format_json` rất nhiều — model BẮT BUỘC dùng
       đúng keys & types. Khi có schema, `format_json` bị bỏ qua.
+    - max_retries: số lần thử lại nếu KHÔNG kết nối được (trước khi stream bắt
+      đầu). Lỗi xảy ra giữa stream sẽ không retry — trả về phần đã sinh.
     """
     merged_options = {
         "temperature": temperature,
@@ -96,14 +108,31 @@ def generate(
     parts: list[str] = []
     total = 0
 
-    r = _SESSION.post(
-        f"{base_url}/api/generate",
-        json=payload,
-        timeout=timeout,
-        stream=True,
-    )
+    # Establish the streaming connection with bounded retries. We only retry
+    # *before* any token has been received, so a partially streamed answer is
+    # never silently duplicated.
+    attempt = 0
+    while True:
+        try:
+            r = _SESSION.post(
+                f"{base_url}/api/generate",
+                json=payload,
+                timeout=(connect_timeout, timeout),
+                stream=True,
+            )
+            r.raise_for_status()
+            # Ensure UTF-8 line decoding regardless of response charset header.
+            r.encoding = "utf-8"
+            break
+        except requests.RequestException:
+            if should_stop is not None and should_stop():
+                return ""
+            attempt += 1
+            if attempt > max_retries:
+                raise
+            time.sleep(retry_backoff * attempt)
+
     try:
-        r.raise_for_status()
         for line in r.iter_lines(decode_unicode=True):
             if should_stop is not None and should_stop():
                 break

@@ -87,6 +87,26 @@ def build_schema_from_template(template_str: str) -> Optional[dict]:
     return _infer_schema(obj)
 
 
+def read_text_file(path: str) -> str:
+    """Read a .txt/.md file robustly, trying common encodings before falling
+    back to a lossy decode. Handles UTF-8 (with/without BOM), UTF-16 and the
+    Vietnamese cp1258 code page rather than silently dropping bytes."""
+    data = Path(path).read_bytes()
+    # UTF-16 only when a BOM proves it — a blind utf-16 decode would happily
+    # mangle plain UTF-8 of even length.
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    for enc in ("utf-8-sig", "cp1258", "latin-1"):
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 def extract_text(
     path: str,
     vision_model: Optional[str] = None,
@@ -104,7 +124,7 @@ def extract_text(
     if ext == ".doc":
         return extract_doc_legacy(path)
     if ext in (".txt", ".md"):
-        return p.read_text(encoding="utf-8", errors="ignore")
+        return read_text_file(path)
     if ext in IMAGE_EXTS:
         return extract_image(
             path,
@@ -124,6 +144,33 @@ def _strip_artifacts(text: str) -> str:
     return text.strip()
 
 
+def parse_json_lenient(text: str):
+    """Best-effort parse of a model answer into a Python object.
+
+    Strips think-blocks / code fences, then tries a direct parse and finally a
+    braces-slice ({...}) parse. Returns the parsed object, or None when nothing
+    parseable was found (caller decides whether to retry or store as raw).
+    """
+    text = _strip_artifacts(text)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _canonical(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
 def normalize_json_output(text: str) -> str:
     """Return a canonical, compact JSON string.
 
@@ -131,21 +178,10 @@ def normalize_json_output(text: str) -> str:
     canonicalize (compact + sorted keys + Unicode preserved) so training data
     is byte-stable. Falls back to {"raw": <text>} for any unparseable cases.
     """
-    text = _strip_artifacts(text)
-    if not text:
-        return json.dumps({"raw": ""}, ensure_ascii=False, separators=(",", ":"))
-    try:
-        obj = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end > start:
-            try:
-                obj = json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                return json.dumps({"raw": text}, ensure_ascii=False, separators=(",", ":"))
-        else:
-            return json.dumps({"raw": text}, ensure_ascii=False, separators=(",", ":"))
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    obj = parse_json_lenient(text)
+    if obj is None:
+        return _canonical({"raw": _strip_artifacts(text)})
+    return _canonical(obj)
 
 
 class Pipeline:
@@ -163,6 +199,9 @@ class Pipeline:
         ollama_url: str = "http://localhost:11434",
         vision_model: str = "",
         output_template: str = "",
+        max_json_retries: int = 1,
+        resume: bool = False,
+        router: Optional[object] = None,
         on_log: Optional[Callable[[str], None]] = None,
         on_progress: Optional[Callable[[int, int, Optional[float]], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
@@ -179,6 +218,11 @@ class Pipeline:
         self.keep_alive = keep_alive
         self.ollama_url = ollama_url
         self.vision_model = (vision_model or "").strip()
+        self.max_json_retries = max(0, int(max_json_retries))
+        self.resume = bool(resume)
+        # Optional LLMRouter (online/mix). When None, the classic single local
+        # Ollama model path is used (self.model + module-level generate()).
+        self.router = router
         self.on_log = on_log or (lambda m: None)
         self.on_progress = on_progress or (lambda c, t, eta=None: None)
         self.on_status = on_status or (lambda s: None)
@@ -188,6 +232,11 @@ class Pipeline:
         # Schema cho Structured Outputs (Ollama ≥ 0.5).
         self.output_template = (output_template or "").strip()
         self.json_schema = build_schema_from_template(self.output_template)
+        self._required_keys = (
+            list(self.json_schema.get("required", []))
+            if isinstance(self.json_schema, dict)
+            else []
+        )
         # Compact template để chèn vào prompt
         if self.output_template:
             try:
@@ -260,7 +309,9 @@ class Pipeline:
                 self._log(f"   ❌ {e}")
         return all_chunks
 
-    def _call_llm(self, prompt: str, idx: int, total: int) -> str:
+    def _call_llm(
+        self, prompt: str, idx: int, total: int, temperature: Optional[float] = None
+    ) -> str:
         t0 = time.time()
         last = [0.0]
 
@@ -272,11 +323,25 @@ class Pipeline:
                     f"Chunk {idx}/{total} · {total_chars:,} ký tự · {now - t0:.1f}s"
                 )
 
+        temp = self.temperature if temperature is None else temperature
+        if self.router is not None:
+            return self.router.generate(
+                prompt,
+                temperature=temp,
+                num_predict=self.num_predict,
+                num_ctx=self.num_ctx,
+                format_json=True,
+                json_schema=self.json_schema,
+                keep_alive=self.keep_alive,
+                on_token=on_tok,
+                should_stop=self.should_stop,
+            )
+
         return generate(
             model=self.model,
             prompt=prompt,
             base_url=self.ollama_url,
-            temperature=self.temperature,
+            temperature=temp,
             num_ctx=self.num_ctx,
             options={"num_predict": self.num_predict},
             format_json=True,
@@ -286,8 +351,67 @@ class Pipeline:
             should_stop=self.should_stop,
         )
 
+    def _schema_ok(self, obj) -> bool:
+        """True if obj satisfies the required top-level keys of the template
+        schema. When no schema is set, any parsed object is acceptable."""
+        if not self._required_keys:
+            return True
+        return isinstance(obj, dict) and all(k in obj for k in self._required_keys)
+
+    def _generate_chunk_json(self, prompt: str, idx: int, total: int) -> tuple[str, bool]:
+        """Call the model, retrying on unparseable / schema-violating output.
+
+        Returns (canonical_json_string, ok). `ok` is False when every attempt
+        failed to yield usable JSON — in that case the string is a {"raw": ...}
+        fallback so no chunk is ever lost.
+        """
+        last_raw = ""
+        for attempt in range(self.max_json_retries + 1):
+            if self.should_stop():
+                break
+            # Nudge temperature up slightly on retries to escape a bad groove.
+            temp = self.temperature if attempt == 0 else min(self.temperature + 0.15 * attempt, 1.0)
+            raw = self._call_llm(prompt, idx, total, temperature=temp)
+            last_raw = raw
+            obj = parse_json_lenient(raw)
+            if obj is not None and self._schema_ok(obj):
+                return _canonical(obj), True
+            if attempt < self.max_json_retries and not self.should_stop():
+                self._log(f"   ↻ {idx}/{total}: JSON chưa đạt, thử lại ({attempt + 1}/{self.max_json_retries})")
+        # Exhausted retries — keep whatever parsed, else raw fallback.
+        obj = parse_json_lenient(last_raw)
+        if obj is not None:
+            return _canonical(obj), False
+        return _canonical({"raw": _strip_artifacts(last_raw)}), False
+
+    def _load_done_keys(self) -> set:
+        """Read (source, chunk_id) pairs already present in the output CSV so a
+        resumed run can skip them. Returns an empty set when not resuming or the
+        file does not exist yet."""
+        if not self.resume:
+            return set()
+        path = Path(self.output_csv)
+        if not path.exists() or path.stat().st_size == 0:
+            return set()
+        import csv as _csv
+
+        done: set = set()
+        try:
+            with open(path, encoding="utf-8-sig", newline="") as f:
+                for row in _csv.DictReader(f):
+                    src = (row.get("source") or "").strip()
+                    cid = (row.get("chunk_id") or "").strip()
+                    if cid != "":
+                        done.add((src, cid))
+        except Exception as e:
+            self._log(f"   ⚠ Không đọc được file resume: {e}")
+        return done
+
     def run(self) -> dict:
-        stats = {"files": len(self.files), "chunks": 0, "samples": 0, "errors": 0}
+        stats = {
+            "files": len(self.files), "chunks": 0, "samples": 0,
+            "errors": 0, "raw_fallbacks": 0, "skipped": 0,
+        }
 
         if not self.instruction:
             self._log("❌ Thiếu instruction — bắt buộc phải có để biết LLM cần làm gì.")
@@ -296,13 +420,18 @@ class Pipeline:
 
         # Warm the model into VRAM before we start timing chunks - first call is
         # often 5-10s of model load that would skew ETA wildly.
-        self._status(f"Đang nạp model {self.model} vào VRAM...")
-        self._log(f"⚙ Preload model: {self.model} (keep_alive={self.keep_alive})")
-        t_warm = time.time()
-        if preload(self.model, base_url=self.ollama_url, keep_alive=self.keep_alive):
-            self._log(f"   ✓ Sẵn sàng ({time.time() - t_warm:.1f}s)")
+        if self.router is not None:
+            self._status("Đang chuẩn bị backend...")
+            self._log(f"⚙ Backends ({len(self.router)}): {', '.join(self.router.names())}")
+            self.router.warmup(keep_alive=self.keep_alive)
         else:
-            self._log("   ⚠ Không preload được (sẽ load khi gọi chunk 1)")
+            self._status(f"Đang nạp model {self.model} vào VRAM...")
+            self._log(f"⚙ Preload model: {self.model} (keep_alive={self.keep_alive})")
+            t_warm = time.time()
+            if preload(self.model, base_url=self.ollama_url, keep_alive=self.keep_alive):
+                self._log(f"   ✓ Sẵn sàng ({time.time() - t_warm:.1f}s)")
+            else:
+                self._log("   ⚠ Không preload được (sẽ load khi gọi chunk 1)")
 
         all_chunks = self._build_chunks()
         total = len(all_chunks)
@@ -328,6 +457,11 @@ class Pipeline:
                 "   ⚠ Schema mẫu không parse được JSON — sẽ chạy JSON loose mode."
             )
         self._log(f"   Chunks: {total}")
+        if self.max_json_retries:
+            self._log(f"   Retry JSON: tối đa {self.max_json_retries} lần/chunk khi output chưa đạt")
+        done_keys = self._load_done_keys()
+        if done_keys:
+            self._log(f"   ⏭ Resume: bỏ qua {len(done_keys)} chunk đã có trong file output")
         self.on_progress(0, total, None)
         self._status(f"Đang xử lý 0/{total}...")
 
@@ -342,6 +476,10 @@ class Pipeline:
                 if self.should_stop():
                     self._log(f"⏹ Dừng ở chunk {i}/{total}.")
                     break
+                if done_keys and (src, str(cid)) in done_keys:
+                    stats["skipped"] += 1
+                    self.on_progress(i, total, None)
+                    continue
                 t0 = time.time()
                 try:
                     prompt = PROMPT_TEMPLATE.format(
@@ -349,8 +487,9 @@ class Pipeline:
                         schema_block=schema_block,
                         chunk=chunk,
                     )
-                    raw = self._call_llm(prompt, i, total)
-                    output = normalize_json_output(raw)
+                    output, ok = self._generate_chunk_json(prompt, i, total)
+                    if not ok:
+                        stats["raw_fallbacks"] += 1
                     n = writer.write_samples(
                         [{"instruction": self.instruction, "input": chunk, "output": output}],
                         src,
@@ -358,16 +497,23 @@ class Pipeline:
                     )
                     stats["samples"] += n
                     elapsed = time.time() - t0
-                    self._log(f"   ✓ {i}/{total}: {elapsed:.1f}s · {len(output)} ký tự JSON")
+                    flag = "" if ok else " ⚠ raw"
+                    bk = f" · {self.router.last_backend}" if self.router is not None else ""
+                    self._log(f"   ✓ {i}/{total}: {elapsed:.1f}s · {len(output)} ký tự JSON{flag}{bk}")
                     stats["chunks"] += 1
                 except Exception as e:
                     stats["errors"] += 1
                     self._log(f"   ❌ {i}/{total}: {e}")
                 self._record(i, total, time.time() - t0)
 
+        extra = ""
+        if stats["raw_fallbacks"]:
+            extra += f" | JSON raw: {stats['raw_fallbacks']}"
+        if stats["skipped"]:
+            extra += f" | Bỏ qua (resume): {stats['skipped']}"
         self._log(
             f"✅ Xong! Chunks: {stats['chunks']} | Samples: {stats['samples']} | "
-            f"Lỗi: {stats['errors']}"
+            f"Lỗi: {stats['errors']}{extra}"
         )
         self._log(f"📁 {self.output_csv}")
         self._status(

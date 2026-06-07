@@ -10,8 +10,11 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from src.csv_flatten import flatten_csv
+from src.llm_backends import LLMRouter, OllamaBackend
 from src.ollama_client import is_running, list_models
 from src.pipeline import Pipeline
+from src.providers import DEFAULT_PATH as PROVIDERS_PATH
+from src.providers import load_backends
 from src.sysmon import SystemMonitor
 
 # Optional drag-and-drop support via tkinterdnd2. If missing, app still
@@ -99,6 +102,7 @@ class App:
         self.files: list[str] = []
         self.worker: threading.Thread | None = None
         self.stop_flag = False
+        self.online_backends: list = []   # rotation pool loaded from providers.json
 
         self.sysmon = SystemMonitor()
         self._sysmon_job: Optional[str] = None
@@ -108,6 +112,7 @@ class App:
 
         self._build_ui()
         self.refresh_models()
+        self.load_providers(silent=True)
         self._schedule_sysmon()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -247,6 +252,39 @@ class App:
         ttk.Label(r3, text="keep_alive:").pack(side="left", padx=(18, 0))
         self.var_keep = tk.StringVar(value="30m")
         ttk.Entry(r3, textvariable=self.var_keep, width=6).pack(side="left", padx=6)
+
+        r4 = ttk.Frame(cbox); r4.pack(fill="x", **pad)
+        ttk.Label(r4, text="Retry JSON:").pack(side="left")
+        self.var_retries = tk.IntVar(value=1)
+        ttk.Spinbox(r4, from_=0, to=5, increment=1,
+                    textvariable=self.var_retries, width=6).pack(side="left", padx=6)
+        ttk.Label(
+            r4, text="(thử lại khi output chưa đạt JSON/schema)",
+            foreground="gray",
+        ).pack(side="left", padx=(2, 0))
+
+        self.var_resume = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            r4, text="Resume (ghi tiếp file output, bỏ qua chunk đã có)",
+            variable=self.var_resume,
+        ).pack(side="left", padx=(24, 0))
+
+        # Chế độ chạy: offline (Ollama) / online (API xoay vòng) / mix (cả hai)
+        r5 = ttk.Frame(cbox); r5.pack(fill="x", **pad)
+        ttk.Label(r5, text="Chế độ:", width=14).pack(side="left")
+        self.var_mode = tk.StringVar(value="offline")
+        for val, label in (
+            ("offline", "Offline (Ollama)"),
+            ("online", "Online (API xoay vòng)"),
+            ("mix", "Mix (Ollama + API)"),
+        ):
+            ttk.Radiobutton(
+                r5, text=label, value=val, variable=self.var_mode,
+                command=self._on_mode_change,
+            ).pack(side="left", padx=(0, 10))
+        ttk.Button(r5, text="↻ Tải providers", command=self.load_providers).pack(side="left", padx=(8, 6))
+        self.lbl_providers = ttk.Label(r5, text="", foreground="gray")
+        self.lbl_providers.pack(side="left")
 
         # ===== Action buttons =====
         abox = ttk.Frame(main)
@@ -532,6 +570,62 @@ class App:
         self.cmb_model.set(chosen or models[0])
         self.lbl_ollama.config(text=f"✓ {len(models)} model có sẵn", foreground="#0a8a3a")
 
+    # ---------------------------------------------------- providers / mode
+    def load_providers(self, silent: bool = False) -> None:
+        """(Re)load the online rotation pool from providers.json."""
+        try:
+            self.online_backends = load_backends(
+                PROVIDERS_PATH, on_log=(None if silent else self.log)
+            )
+        except Exception as e:
+            self.online_backends = []
+            if not silent:
+                self.log(f"⚠ Lỗi nạp providers: {e}")
+        self._update_providers_label()
+
+    def _update_providers_label(self) -> None:
+        n = len(self.online_backends)
+        if n:
+            self.lbl_providers.config(
+                text=f"✓ {n} model online", foreground="#0a8a3a"
+            )
+        else:
+            self.lbl_providers.config(
+                text=f"chưa có (tạo {PROVIDERS_PATH})", foreground="orange"
+            )
+
+    def _on_mode_change(self) -> None:
+        mode = self.var_mode.get()
+        if mode in ("online", "mix") and not self.online_backends:
+            self.log(
+                f"ℹ Chế độ '{mode}' cần API online — copy providers.example.json "
+                f"thành {PROVIDERS_PATH}, điền key rồi bấm '↻ Tải providers'."
+            )
+
+    def _build_router(self):
+        """Build the LLMRouter for the current mode, or None for pure offline.
+
+        Returns (router_or_None, error_message_or_None)."""
+        mode = self.var_mode.get()
+        if mode == "offline":
+            return None, None
+
+        if mode in ("online", "mix") and not self.online_backends:
+            return None, (
+                f"Chế độ '{mode}' cần ít nhất một model online.\n"
+                f"Copy providers.example.json → {PROVIDERS_PATH}, điền API key "
+                "(free), rồi bấm '↻ Tải providers'."
+            )
+
+        backends = list(self.online_backends)
+        if mode == "mix":
+            model = self.cmb_model.get().strip()
+            if not model:
+                return None, "Chế độ Mix cần chọn thêm một Model Ollama."
+            backends = [OllamaBackend(model)] + backends
+
+        return LLMRouter(backends, on_log=self.log), None
+
     # ---------------------------------------------------- logging & progress
     def _flush_logs(self) -> None:
         self._log_flush_job = None
@@ -577,8 +671,17 @@ class App:
         if not self.files:
             messagebox.showwarning("Thiếu file", "Vui lòng thêm ít nhất một file.")
             return
+
+        mode = self.var_mode.get()
+        router, router_err = self._build_router()
+        if router_err:
+            messagebox.showwarning("Chế độ chạy", router_err)
+            return
+
         model = self.cmb_model.get().strip()
-        if not model:
+        # Offline mode chạy trực tiếp self.model nên bắt buộc chọn. Online dùng
+        # router (model bỏ trống được). Mix đã kiểm tra model trong _build_router.
+        if mode == "offline" and not model:
             messagebox.showwarning("Thiếu model", "Vui lòng chọn model Ollama.")
             return
 
@@ -606,9 +709,15 @@ class App:
             )
             return
 
-        # Mỗi run tạo file mới với timestamp - tránh lock Excel/OneDrive
-        out = self._timestamped_path(out_template)
-        self.log(f"\n=== Bắt đầu run | Model: {model} ===")
+        # Resume → ghi tiếp vào đúng file người dùng chọn (không timestamp) để
+        # tìm lại được chunk đã làm. Ngược lại mỗi run tạo file mới với timestamp
+        # - tránh lock Excel/OneDrive.
+        resume = bool(self.var_resume.get())
+        out = out_template if resume else self._timestamped_path(out_template)
+        if router is not None:
+            self.log(f"\n=== Bắt đầu run | Chế độ: {mode} | {len(router)} backend xoay vòng ===")
+        else:
+            self.log(f"\n=== Bắt đầu run | Model: {model} ===")
         if has_image:
             self.log(f"🖼 Model đọc ảnh (OCR): {vision_model}")
         self.log(f"📁 Output file: {out}")
@@ -631,6 +740,9 @@ class App:
             keep_alive=self.var_keep.get().strip() or "30m",
             vision_model=vision_model,
             output_template=self.var_schema.get().strip(),
+            max_json_retries=int(self.var_retries.get()),
+            resume=resume,
+            router=router,
             on_log=self.log,
             on_progress=self.update_progress,
             on_status=self.update_status,

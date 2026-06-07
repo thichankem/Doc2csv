@@ -22,6 +22,26 @@ Phần mềm desktop trích xuất dữ liệu từ file **PDF / DOCX / DOC / TX
 - **System monitor**: CPU / RAM / GPU / VRAM realtime (NVIDIA NVML)
 - DPI-aware Tkinter: sắc nét trên màn hình HiDPI
 - Append-mode CSV: dừng giữa chừng không mất dữ liệu
+- **Tự retry khi output chưa đạt**: nếu model trả về không phải JSON hợp lệ
+  (hoặc thiếu key bắt buộc của schema), tự gọi lại tối đa N lần — chất lượng
+  dataset cao hơn hẳn với model nhỏ. Chunk không bao giờ bị mất (fallback
+  `{"raw": ...}` nếu hết lượt thử)
+- **Resume**: chạy tiếp vào đúng file output cũ, tự bỏ qua chunk đã có
+  (theo `source` + `chunk_id`) — chạy lại sau khi dừng không tốn công làm lại
+- **Bền với lỗi mạng**: tự retry khi mất kết nối Ollama giữa batch dài
+- **Đọc text đa encoding**: UTF-8 (có/không BOM), UTF-16, cp1258 (tiếng Việt)
+  — không âm thầm mất ký tự
+- **3 chế độ chạy — Offline / Online / Mix**:
+  - **Offline**: chỉ model local qua Ollama (mặc định, dữ liệu không ra ngoài)
+  - **Online**: gọi **API AI online** theo chuẩn OpenAI-compatible (OpenRouter,
+    Groq, Gemini, Mistral, Cerebras…). **Xoay vòng (round-robin)** nhiều model:
+    khi một endpoint dính rate-limit (429) → tự nghỉ và chuyển sang model kế tiếp
+    nên chạy **liên tục** qua giới hạn free-tier
+  - **Mix**: trộn cả model Ollama local **và** các model API online trong cùng
+    một vòng xoay
+  - Cấu hình endpoint/model/API key trong `providers.json` (xem
+    `providers.example.json`). Mỗi cặp *endpoint × model* là 1 mắt xích vòng xoay
+    → liệt kê càng nhiều model free, chạy càng lâu trước khi chạm giới hạn
 
 ---
 
@@ -93,6 +113,9 @@ python app.py
    - **Temp**: độ ngẫu nhiên (0.0 = deterministic, 0.3 = ổn định)
    - **num_ctx**: context window (4096 đủ cho chunk 200 từ)
    - **keep_alive**: thời gian giữ model trong VRAM (30m mặc định — tăng nếu test liên tục)
+   - **Retry JSON**: số lần gọi lại model nếu output chưa đạt JSON/schema (mặc định 1)
+   - **Resume**: tick để ghi tiếp vào file output đã chọn và bỏ qua chunk đã làm
+     (khi bật, app **không** thêm timestamp vào tên file để tìm lại được chunk cũ)
 5. Bấm **▶ Bắt đầu trích xuất**
 
 Mỗi chunk → 1 dòng CSV:
@@ -100,6 +123,33 @@ Mỗi chunk → 1 dòng CSV:
 | instruction | input | output |
 |---|---|---|
 | (text bạn nhập) | (nội dung chunk) | `{"question":"...","answer":"..."}` |
+
+### 2b. Chạy Online / Mix (API xoay vòng)
+
+1. Copy `providers.example.json` thành **`providers.json`** (file này đã được
+   `.gitignore` để không lộ key).
+2. Bật endpoint muốn dùng (`"enabled": true`), điền model free và **API key**.
+   Key có thể ghi thẳng hoặc dùng biến môi trường:
+   ```json
+   "api_key": "env:OPENROUTER_API_KEY"
+   ```
+   ```powershell
+   $env:OPENROUTER_API_KEY = "sk-or-..."   # đặt trước khi mở app
+   ```
+3. Trong GUI: bấm **↻ Tải providers** → thấy “✓ N model online”.
+4. Chọn **Chế độ**: `Online` (chỉ API) hoặc `Mix` (Ollama + API). Bấm
+   **▶ Bắt đầu** như bình thường.
+
+Mỗi chunk sẽ dùng model kế tiếp trong vòng xoay; endpoint nào dính rate-limit
+(429) sẽ tự nghỉ rồi app chuyển sang model khác — log hiển thị backend đã dùng ở
+cuối mỗi dòng `✓`.
+
+> Gợi ý nhà cung cấp free phổ biến (đều OpenAI-compatible): **OpenRouter** (nhiều
+> model `:free`, 1 key dùng được nhiều model), **Groq**, **Google Gemini**
+> (`/v1beta/openai`), **Cerebras**, **Mistral**.
+>
+> ⚠ Đọc ảnh (OCR) vẫn dùng model **vision của Ollama** — chế độ Online thuần mà
+> có file ảnh thì vẫn cần Ollama chạy để OCR.
 
 ### 3. Định dạng CSV output
 
@@ -141,9 +191,27 @@ Doc2csv-ai/
     │   ├── docx_extractor.py   # python-docx + win32com (.doc)
     │   └── image_extractor.py  # OCR ảnh qua Ollama vision model
     ├── text_chunker.py         # Paragraph/sentence-aware chunking
-    ├── ollama_client.py        # Ollama HTTP client
+    ├── ollama_client.py        # Ollama HTTP client (local)
+    ├── openai_client.py        # OpenAI-compatible client (API online)
+    ├── llm_backends.py         # Backend abstraction + router xoay vòng
+    ├── providers.py            # Đọc providers.json → pool backend online
     ├── csv_writer.py           # Alpaca CSV writer (append-mode)
-    └── pipeline.py             # Orchestrator
+    └── pipeline.py             # Orchestrator (retry JSON + resume + router)
+├── providers.example.json      # Mẫu cấu hình API online (copy → providers.json)
+└── tests/                      # pytest suite (chunker, JSON, CSV, retry, online, router)
+```
+
+---
+
+## Kiểm thử
+
+Bộ test `pytest` bao phủ toàn bộ logic pure-Python (chunking, chuẩn hoá JSON,
+suy schema, CSV writer/flatten, retry, resume, đọc đa encoding) cộng một test
+chạy `Pipeline.run` end-to-end với backend Ollama giả lập — **không cần Ollama
+thật để chạy test**.
+
+```powershell
+& "$env:USERPROFILE\anaconda3\python.exe" -m pytest -q
 ```
 
 ---
@@ -168,7 +236,12 @@ Doc2csv-ai/
 - Không. Mỗi chunk được flush ngay vào CSV sau khi xử lý. Chạy lại sẽ append tiếp.
 
 **Hỏi: Một số chunk báo "không parse được JSON"?**
-- Thường gặp với model nhỏ (<7B). Hạ `temperature` xuống 0.1-0.2 hoặc đổi model mạnh hơn.
+- App đã tự **retry** (mặc định 1 lần, chỉnh ở ô "Retry JSON") khi output chưa
+  đạt JSON/schema — tăng số lần retry thường xử lý hết.
+- Vẫn còn lỗi? Thường gặp với model nhỏ (<7B). Hạ `temperature` xuống 0.1-0.2,
+  điền **Schema mẫu** để bật Structured Outputs, hoặc đổi model mạnh hơn.
+- Chunk hết lượt thử vẫn lỗi sẽ được lưu dạng `{"raw": "..."}` (không mất dữ liệu)
+  và đếm riêng ở dòng tổng kết ("JSON raw: N").
 
 ---
 

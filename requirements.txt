@@ -6,3 +6,6 @@ psutil>=5.9.0
 nvidia-ml-py>=12.0.0
 tkinterdnd2>=0.4.2
 pywin32>=306; sys_platform == "win32"
+
+# Dev / test (tùy chọn): chạy `pytest` ở thư mục gốc để kiểm thử
+pytest>=8.0.0

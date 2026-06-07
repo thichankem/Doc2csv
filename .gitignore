@@ -9,6 +9,9 @@ env/
 output/
 *.csv
 
+# API keys — giữ providers.example.json, KHÔNG commit file thật
+providers.json
+
 .idea/
 .vscode/
 .DS_Store
