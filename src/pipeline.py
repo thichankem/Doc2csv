@@ -310,7 +310,8 @@ class Pipeline:
         return all_chunks
 
     def _call_llm(
-        self, prompt: str, idx: int, total: int, temperature: Optional[float] = None
+        self, prompt: str, idx: int, total: int,
+        temperature: Optional[float] = None, num_predict: Optional[int] = None,
     ) -> str:
         t0 = time.time()
         last = [0.0]
@@ -324,11 +325,12 @@ class Pipeline:
                 )
 
         temp = self.temperature if temperature is None else temperature
+        npredict = self.num_predict if num_predict is None else num_predict
         if self.router is not None:
             return self.router.generate(
                 prompt,
                 temperature=temp,
-                num_predict=self.num_predict,
+                num_predict=npredict,
                 num_ctx=self.num_ctx,
                 format_json=True,
                 json_schema=self.json_schema,
@@ -343,7 +345,7 @@ class Pipeline:
             base_url=self.ollama_url,
             temperature=temp,
             num_ctx=self.num_ctx,
-            options={"num_predict": self.num_predict},
+            options={"num_predict": npredict},
             format_json=True,
             json_schema=self.json_schema,
             keep_alive=self.keep_alive,
@@ -369,15 +371,21 @@ class Pipeline:
         for attempt in range(self.max_json_retries + 1):
             if self.should_stop():
                 break
-            # Nudge temperature up slightly on retries to escape a bad groove.
+            # On retries: nudge temperature up slightly to escape a bad groove,
+            # AND raise num_predict — the #1 cause of unparseable JSON in
+            # structured mode is the answer being truncated at the token cap.
             temp = self.temperature if attempt == 0 else min(self.temperature + 0.15 * attempt, 1.0)
-            raw = self._call_llm(prompt, idx, total, temperature=temp)
+            npredict = self.num_predict if attempt == 0 else min(self.num_predict * (attempt + 1), 4096)
+            raw = self._call_llm(prompt, idx, total, temperature=temp, num_predict=npredict)
             last_raw = raw
             obj = parse_json_lenient(raw)
             if obj is not None and self._schema_ok(obj):
                 return _canonical(obj), True
             if attempt < self.max_json_retries and not self.should_stop():
-                self._log(f"   ↻ {idx}/{total}: JSON chưa đạt, thử lại ({attempt + 1}/{self.max_json_retries})")
+                self._log(
+                    f"   ↻ {idx}/{total}: JSON chưa đạt, thử lại "
+                    f"({attempt + 1}/{self.max_json_retries}, num_predict→{min(self.num_predict * (attempt + 2), 4096)})"
+                )
         # Exhausted retries — keep whatever parsed, else raw fallback.
         obj = parse_json_lenient(last_raw)
         if obj is not None:

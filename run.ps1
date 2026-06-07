@@ -1,14 +1,30 @@
-# Doc2CSV-AI launcher (PowerShell) - uses Anaconda Python (where deps are installed)
+# Doc2CSV-AI launcher (PowerShell, portable) - tu tao .venv + cai deps lan dau.
 $ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
 
-$py = Join-Path $env:USERPROFILE "anaconda3\python.exe"
-
-if (-not (Test-Path $py)) {
-    Write-Host "[LOI] Khong tim thay Anaconda Python tai: $py" -ForegroundColor Red
-    Write-Host "Vui long sua bien `$py trong run.ps1 tro toi python.exe co cai deps." -ForegroundColor Yellow
-    Read-Host "Nhan Enter de thoat"
-    exit 1
+# 1) Tim Python
+$pyexe = $null; $pyargs = @()
+if (Get-Command py -ErrorAction SilentlyContinue) { $pyexe = "py"; $pyargs = @("-3") }
+elseif (Get-Command python -ErrorAction SilentlyContinue) { $pyexe = "python" }
+elseif (Test-Path "$env:USERPROFILE\anaconda3\python.exe") { $pyexe = "$env:USERPROFILE\anaconda3\python.exe" }
+else {
+    Write-Host "[LOI] Khong tim thay Python. Cai Python 3.10+ tu https://www.python.org/downloads/" -ForegroundColor Red
+    Read-Host "Nhan Enter de thoat"; exit 1
 }
 
-Set-Location $PSScriptRoot
-& $py app.py
+# 2) Tao venv lan dau
+if (-not (Test-Path ".venv\Scripts\python.exe")) {
+    Write-Host "[SETUP] Tao moi truong .venv (lan dau)..." -ForegroundColor Cyan
+    & $pyexe @pyargs -m venv .venv
+}
+
+# 3) Cai deps lan dau
+if (-not (Test-Path ".venv\.deps_ok")) {
+    Write-Host "[SETUP] Cai thu vien (lan dau, can mang)..." -ForegroundColor Cyan
+    & ".venv\Scripts\python.exe" -m pip install --upgrade pip
+    & ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+    "ok" | Out-File -Encoding ascii ".venv\.deps_ok"
+}
+
+# 4) Chay app
+& ".venv\Scripts\pythonw.exe" app.py

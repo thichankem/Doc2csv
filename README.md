@@ -23,9 +23,10 @@ Phần mềm desktop trích xuất dữ liệu từ file **PDF / DOCX / DOC / TX
 - DPI-aware Tkinter: sắc nét trên màn hình HiDPI
 - Append-mode CSV: dừng giữa chừng không mất dữ liệu
 - **Tự retry khi output chưa đạt**: nếu model trả về không phải JSON hợp lệ
-  (hoặc thiếu key bắt buộc của schema), tự gọi lại tối đa N lần — chất lượng
-  dataset cao hơn hẳn với model nhỏ. Chunk không bao giờ bị mất (fallback
-  `{"raw": ...}` nếu hết lượt thử)
+  (hoặc thiếu key bắt buộc của schema), tự gọi lại tối đa N lần — và **mỗi lần
+  retry tự tăng `num_predict`** để chống lỗi JSON bị cắt cụt (nguyên nhân hỏng
+  phổ biến nhất ở chế độ structured). Chất lượng dataset cao hơn hẳn với model
+  nhỏ. Chunk không bao giờ bị mất (fallback `{"raw": ...}` nếu hết lượt thử)
 - **Resume**: chạy tiếp vào đúng file output cũ, tự bỏ qua chunk đã có
   (theo `source` + `chunk_id`) — chạy lại sau khi dừng không tốn công làm lại
 - **Bền với lỗi mạng**: tự retry khi mất kết nối Ollama giữa batch dài
@@ -40,8 +41,13 @@ Phần mềm desktop trích xuất dữ liệu từ file **PDF / DOCX / DOC / TX
   - **Mix**: trộn cả model Ollama local **và** các model API online trong cùng
     một vòng xoay
   - Cấu hình endpoint/model/API key trong `providers.json` (xem
-    `providers.example.json`). Mỗi cặp *endpoint × model* là 1 mắt xích vòng xoay
-    → liệt kê càng nhiều model free, chạy càng lâu trước khi chạm giới hạn
+    `providers.example.json`) **hoặc chọn trực tiếp trong GUI** qua nút
+    **➕ Chọn provider** (có sẵn preset OpenRouter/Groq/Gemini/Cerebras/Mistral).
+    Mỗi cặp *endpoint × model* là 1 mắt xích vòng xoay → liệt kê càng nhiều model
+    free, chạy càng lâu trước khi chạm giới hạn
+- **Khởi chạy 1-click**: `Install-Desktop-Icon.bat` tạo icon ra Desktop; launcher
+  `run.bat` tự tạo `.venv` + cài thư viện lần đầu → pull từ GitHub về máy mới là
+  chạy được ngay
 
 ---
 
@@ -73,13 +79,24 @@ Trên Windows, gói `pywin32` sẽ được cài tự động để hỗ trợ f
 
 ### 1. Mở GUI
 
-**Cách đơn giản nhất** (Windows) — double-click hoặc gõ trong CMD:
+**Cách dễ nhất — tạo icon ngoài Desktop** (làm 1 lần sau khi clone):
+
+```cmd
+Install-Desktop-Icon.bat
+```
+
+→ Xuất hiện icon **Doc2CSV-AI** trên Desktop. Từ nay chỉ cần **double-click icon**
+là chạy. Lần chạy đầu, launcher tự tạo `.venv` và cài thư viện (cần mạng); các lần
+sau mở thẳng. Hoạt động trên **máy mới vừa pull từ GitHub** miễn có Python 3.10+.
+
+**Hoặc** double-click trực tiếp:
 
 ```cmd
 run.bat
 ```
 
-Launcher này tự gọi Python ở `%USERPROFILE%\anaconda3\python.exe` (nơi đã cài đầy đủ deps).
+`run.bat` tự tìm Python (`py` / `python` / Anaconda), tự tạo `.venv` + cài deps
+lần đầu rồi chạy app — không cần chỉnh sửa đường dẫn thủ công.
 
 Hoặc trong PowerShell:
 
@@ -126,19 +143,20 @@ Mỗi chunk → 1 dòng CSV:
 
 ### 2b. Chạy Online / Mix (API xoay vòng)
 
-1. Copy `providers.example.json` thành **`providers.json`** (file này đã được
-   `.gitignore` để không lộ key).
-2. Bật endpoint muốn dùng (`"enabled": true`), điền model free và **API key**.
-   Key có thể ghi thẳng hoặc dùng biến môi trường:
-   ```json
-   "api_key": "env:OPENROUTER_API_KEY"
-   ```
-   ```powershell
-   $env:OPENROUTER_API_KEY = "sk-or-..."   # đặt trước khi mở app
-   ```
-3. Trong GUI: bấm **↻ Tải providers** → thấy “✓ N model online”.
-4. Chọn **Chế độ**: `Online` (chỉ API) hoặc `Mix` (Ollama + API). Bấm
-   **▶ Bắt đầu** như bình thường.
+**Cách dễ nhất — chọn provider ngay trong GUI:**
+
+1. Bấm **➕ Chọn provider** → cửa sổ quản lý hiện ra.
+2. Chọn **Loại** từ danh sách dựng sẵn (OpenRouter, Groq, Google Gemini,
+   Cerebras, Mistral, Ollama local, hoặc Tùy chỉnh) → tự điền `base_url` và
+   model free gợi ý. Có link lấy API key cho từng loại.
+3. Dán **API key** (mặc định lưu an toàn qua biến môi trường, không ghi thẳng vào
+   file). Có thể bấm **↻ Lấy models từ server** để lấy đúng danh sách model.
+4. Bấm **💾 Lưu provider** → ghi vào `providers.json` và nạp luôn.
+5. Chọn **Chế độ**: `Online` (chỉ API) hoặc `Mix` (Ollama + API) → **▶ Bắt đầu**.
+
+> Cũng có thể tự sửa tay: copy `providers.example.json` → **`providers.json`**
+> (đã `.gitignore`), điền key/model, rồi bấm **↻ Tải**. Key dùng biến môi trường:
+> `"api_key": "env:OPENROUTER_API_KEY"` + `setx OPENROUTER_API_KEY "sk-or-..."`.
 
 Mỗi chunk sẽ dùng model kế tiếp trong vòng xoay; endpoint nào dính rate-limit
 (429) sẽ tự nghỉ rồi app chuyển sang model khác — log hiển thị backend đã dùng ở
@@ -183,6 +201,10 @@ File CSV dùng UTF-8 BOM — mở Excel hiển thị tiếng Việt đúng ngay.
 ```
 Doc2csv-ai/
 ├── app.py                  # GUI entry point
+├── run.bat / run.ps1       # Launcher portable (tự tạo .venv + cài deps)
+├── Install-Desktop-Icon.bat / .ps1   # Tạo icon Desktop
+├── assets/icon.ico         # Icon ứng dụng
+├── tools/make_icon.py      # Script tạo lại icon
 ├── requirements.txt
 ├── README.md
 └── src/

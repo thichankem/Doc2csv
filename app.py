@@ -12,7 +12,15 @@ from typing import Optional
 from src.csv_flatten import flatten_csv
 from src.llm_backends import LLMRouter, OllamaBackend
 from src.ollama_client import is_running, list_models
+from src.openai_client import list_models as openai_list_models
 from src.pipeline import Pipeline
+from src.providers import (
+    PRESETS,
+    add_endpoint,
+    load_config,
+    preset_names,
+    save_config,
+)
 from src.providers import DEFAULT_PATH as PROVIDERS_PATH
 from src.providers import load_backends
 from src.sysmon import SystemMonitor
@@ -282,7 +290,8 @@ class App:
                 r5, text=label, value=val, variable=self.var_mode,
                 command=self._on_mode_change,
             ).pack(side="left", padx=(0, 10))
-        ttk.Button(r5, text="↻ Tải providers", command=self.load_providers).pack(side="left", padx=(8, 6))
+        ttk.Button(r5, text="➕ Chọn provider", command=self.manage_providers).pack(side="left", padx=(8, 6))
+        ttk.Button(r5, text="↻ Tải", command=self.load_providers).pack(side="left", padx=(0, 6))
         self.lbl_providers = ttk.Label(r5, text="", foreground="gray")
         self.lbl_providers.pack(side="left")
 
@@ -625,6 +634,161 @@ class App:
             backends = [OllamaBackend(model)] + backends
 
         return LLMRouter(backends, on_log=self.log), None
+
+    # ---------------------------------------------------- provider dialog
+    def manage_providers(self) -> None:
+        """Cửa sổ chọn loại provider, điền key/model rồi lưu vào providers.json."""
+        win = tk.Toplevel(self.root)
+        win.title("Chọn / quản lý provider API online")
+        win.geometry("680x620")
+        win.transient(self.root)
+        pad = {"padx": 12, "pady": 6}
+
+        # ----- Preset -----
+        top = ttk.LabelFrame(win, text="  Thêm provider  ")
+        top.pack(fill="x", **pad)
+
+        r = ttk.Frame(top); r.pack(fill="x", padx=10, pady=6)
+        ttk.Label(r, text="Loại:", width=10).pack(side="left")
+        cmb = ttk.Combobox(r, state="readonly", width=32, values=preset_names())
+        cmb.pack(side="left", padx=6)
+        lbl_key_url = ttk.Label(r, text="", foreground="#0066cc")
+        lbl_key_url.pack(side="left", padx=8)
+
+        r1 = ttk.Frame(top); r1.pack(fill="x", padx=10, pady=6)
+        ttk.Label(r1, text="Tên:", width=10).pack(side="left")
+        var_name = tk.StringVar()
+        ttk.Entry(r1, textvariable=var_name, width=28).pack(side="left", padx=6)
+        ttk.Label(r1, text="base_url:").pack(side="left", padx=(10, 0))
+        var_base = tk.StringVar()
+        ttk.Entry(r1, textvariable=var_base, width=34).pack(side="left", fill="x", expand=True, padx=6)
+
+        r2 = ttk.Frame(top); r2.pack(fill="x", padx=10, pady=6)
+        ttk.Label(r2, text="API key:", width=10).pack(side="left")
+        var_key = tk.StringVar()
+        ttk.Entry(r2, textvariable=var_key, width=40, show="•").pack(side="left", fill="x", expand=True, padx=6)
+        var_env = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r2, text="Lưu qua biến môi trường", variable=var_env).pack(side="left", padx=6)
+
+        r3 = ttk.Frame(top); r3.pack(fill="both", padx=10, pady=6)
+        ttk.Label(r3, text="Models (mỗi dòng 1 model):").pack(anchor="w")
+        txt_models = tk.Text(r3, height=5, font=("Consolas", 9),
+                             highlightthickness=0, borderwidth=1, relief="solid")
+        txt_models.pack(fill="both", expand=True, pady=(4, 0))
+
+        var_struct = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="structured (gửi json_schema chặt — chỉ model hỗ trợ)",
+                        variable=var_struct).pack(anchor="w", padx=10, pady=(0, 6))
+
+        def on_preset(_evt=None):
+            p = PRESETS.get(cmb.get())
+            if not p:
+                return
+            var_name.set(cmb.get())
+            var_base.set(p["base_url"])
+            txt_models.delete("1.0", "end")
+            txt_models.insert("1.0", "\n".join(p.get("models", [])))
+            var_struct.set(bool(p.get("structured", False)))
+            ku = p.get("key_url", "")
+            env = p.get("key_env", "")
+            hint = f"Lấy key: {ku}" if ku else "Không cần key (local)"
+            if env and os.environ.get(env):
+                hint += f"  ·  đã có {env} trong môi trường"
+            lbl_key_url.config(text=hint)
+        cmb.bind("<<ComboboxSelected>>", on_preset)
+
+        def fetch_models():
+            base = var_base.get().strip()
+            if not base:
+                messagebox.showinfo("Models", "Điền base_url trước.", parent=win)
+                return
+            ms = openai_list_models(base, var_key.get().strip())
+            if ms:
+                txt_models.delete("1.0", "end")
+                txt_models.insert("1.0", "\n".join(ms))
+            else:
+                messagebox.showinfo(
+                    "Models",
+                    "Không lấy được danh sách model (kiểm tra base_url/key) — "
+                    "bạn vẫn có thể tự gõ tên model.",
+                    parent=win,
+                )
+
+        # ----- Current endpoints list -----
+        bot = ttk.LabelFrame(win, text="  Đã lưu trong providers.json  ")
+        bot.pack(fill="both", expand=True, **pad)
+        lst = tk.Listbox(bot, height=6, font=("Consolas", 9))
+        lst.pack(fill="both", expand=True, padx=10, pady=8)
+
+        def refresh_list():
+            lst.delete(0, "end")
+            cfg = load_config(PROVIDERS_PATH)
+            for ep in cfg.get("endpoints", []):
+                state = "on " if ep.get("enabled", True) else "off"
+                nmodels = len(ep.get("models", []))
+                lst.insert("end", f"[{state}] {ep.get('name')} · {nmodels} model · {ep.get('base_url')}")
+        refresh_list()
+
+        def save_provider():
+            name = var_name.get().strip()
+            base = var_base.get().strip()
+            if not name or not base:
+                messagebox.showwarning("Thiếu thông tin", "Cần Tên và base_url.", parent=win)
+                return
+            models = [m.strip() for m in txt_models.get("1.0", "end-1c").splitlines() if m.strip()]
+            if not models:
+                messagebox.showwarning("Thiếu model", "Nhập ít nhất một model.", parent=win)
+                return
+            p = PRESETS.get(cmb.get(), {})
+            cfg = load_config(PROVIDERS_PATH)
+            add_endpoint(
+                cfg, name=name, base_url=base, api_key=var_key.get().strip(),
+                models=models, structured=bool(var_struct.get()),
+                headers=p.get("headers"), store_key_in_env=bool(var_env.get()),
+            )
+            save_config(cfg, PROVIDERS_PATH)
+            refresh_list()
+            self.load_providers()
+            messagebox.showinfo("Đã lưu", f"Đã lưu '{name}' vào {PROVIDERS_PATH}.", parent=win)
+
+        def remove_selected():
+            sel = lst.curselection()
+            if not sel:
+                return
+            cfg = load_config(PROVIDERS_PATH)
+            eps = cfg.get("endpoints", [])
+            idx = sel[0]
+            if 0 <= idx < len(eps):
+                removed = eps.pop(idx)
+                save_config(cfg, PROVIDERS_PATH)
+                refresh_list()
+                self.load_providers()
+                self.log(f"🗑 Đã xoá provider: {removed.get('name')}")
+
+        def toggle_selected():
+            sel = lst.curselection()
+            if not sel:
+                return
+            cfg = load_config(PROVIDERS_PATH)
+            eps = cfg.get("endpoints", [])
+            idx = sel[0]
+            if 0 <= idx < len(eps):
+                eps[idx]["enabled"] = not eps[idx].get("enabled", True)
+                save_config(cfg, PROVIDERS_PATH)
+                refresh_list()
+                self.load_providers()
+
+        ttk.Button(r3, text="↻ Lấy models từ server", command=fetch_models).pack(anchor="e", pady=(4, 0))
+
+        btns = ttk.Frame(win); btns.pack(fill="x", **pad)
+        ttk.Button(btns, text="💾 Lưu provider", command=save_provider, style="Accent.TButton").pack(side="left")
+        ttk.Button(btns, text="Bật/Tắt mục chọn", command=toggle_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="🗑 Xoá mục chọn", command=remove_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Đóng", command=win.destroy).pack(side="right")
+
+        if preset_names():
+            cmb.set(preset_names()[0])
+            on_preset()
 
     # ---------------------------------------------------- logging & progress
     def _flush_logs(self) -> None:

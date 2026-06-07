@@ -30,6 +30,125 @@ from .llm_backends import OpenAIBackend
 
 DEFAULT_PATH = "providers.json"
 
+# Preset các nhà cung cấp API (đều OpenAI-compatible) + vài model free gợi ý.
+# Dùng cho phần "chọn provider" trong GUI: chọn tên → tự điền base_url + models.
+PRESETS: dict[str, dict] = {
+    "OpenRouter (free)": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "key_env": "OPENROUTER_API_KEY",
+        "key_url": "https://openrouter.ai/keys",
+        "structured": False,
+        "headers": {"HTTP-Referer": "https://localhost", "X-Title": "Doc2CSV-AI"},
+        "models": [
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "google/gemma-2-9b-it:free",
+            "qwen/qwen-2.5-72b-instruct:free",
+            "mistralai/mistral-small-3.1-24b-instruct:free",
+        ],
+    },
+    "Groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "key_env": "GROQ_API_KEY",
+        "key_url": "https://console.groq.com/keys",
+        "structured": False,
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    },
+    "Google Gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "key_env": "GEMINI_API_KEY",
+        "key_url": "https://aistudio.google.com/apikey",
+        "structured": False,
+        "models": ["gemini-2.0-flash", "gemini-2.0-flash-lite"],
+    },
+    "Cerebras": {
+        "base_url": "https://api.cerebras.ai/v1",
+        "key_env": "CEREBRAS_API_KEY",
+        "key_url": "https://cloud.cerebras.ai",
+        "structured": False,
+        "models": ["llama-3.3-70b", "llama3.1-8b"],
+    },
+    "Mistral": {
+        "base_url": "https://api.mistral.ai/v1",
+        "key_env": "MISTRAL_API_KEY",
+        "key_url": "https://console.mistral.ai/api-keys",
+        "structured": False,
+        "models": ["mistral-small-latest"],
+    },
+    "Ollama (local OpenAI API)": {
+        "base_url": "http://localhost:11434/v1",
+        "key_env": "",
+        "key_url": "",
+        "structured": False,
+        "models": [],
+    },
+    "Tùy chỉnh (Custom)": {
+        "base_url": "",
+        "key_env": "",
+        "key_url": "",
+        "structured": False,
+        "models": [],
+    },
+}
+
+
+def preset_names() -> list[str]:
+    return list(PRESETS.keys())
+
+
+def load_config(path: str = DEFAULT_PATH) -> dict:
+    """Read providers.json into a dict, or a fresh {'endpoints': []} if absent."""
+    p = Path(path)
+    if not p.exists():
+        return {"endpoints": []}
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"endpoints": []}
+    if isinstance(cfg, list):
+        cfg = {"endpoints": cfg}
+    cfg.setdefault("endpoints", [])
+    return cfg
+
+
+def save_config(cfg: dict, path: str = DEFAULT_PATH) -> None:
+    Path(path).write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def add_endpoint(
+    cfg: dict,
+    name: str,
+    base_url: str,
+    api_key: str,
+    models: list[str],
+    *,
+    structured: bool = False,
+    headers: dict | None = None,
+    store_key_in_env: bool = False,
+) -> dict:
+    """Append/replace an endpoint in the config. When store_key_in_env, the key
+    is referenced as env:NAME_API_KEY instead of stored literally."""
+    endpoints = [e for e in cfg.get("endpoints", []) if e.get("name") != name]
+    api_key_field = api_key
+    if store_key_in_env and api_key:
+        env_name = name.upper().replace(" ", "_").replace("-", "_") + "_API_KEY"
+        os.environ[env_name] = api_key
+        api_key_field = f"env:{env_name}"
+    ep = {
+        "name": name,
+        "base_url": base_url,
+        "api_key": api_key_field,
+        "enabled": True,
+        "structured": structured,
+        "models": [m for m in models if m.strip()],
+    }
+    if headers:
+        ep["headers"] = headers
+    endpoints.append(ep)
+    cfg["endpoints"] = endpoints
+    return cfg
+
 
 def _resolve_key(val) -> str:
     if isinstance(val, str) and val.startswith("env:"):
