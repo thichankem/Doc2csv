@@ -271,6 +271,15 @@ class App:
             foreground="gray",
         ).pack(side="left", padx=(2, 0))
 
+        ttk.Label(r4, text="Song song:").pack(side="left", padx=(18, 0))
+        self.var_parallel = tk.IntVar(value=1)
+        ttk.Spinbox(r4, from_=1, to=32, increment=1,
+                    textvariable=self.var_parallel, width=5).pack(side="left", padx=6)
+        ttk.Label(
+            r4, text="(số chunk chạy cùng lúc — tăng tốc Online/Mix)",
+            foreground="gray",
+        ).pack(side="left", padx=(2, 0))
+
         self.var_resume = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             r4, text="Resume (ghi tiếp file output, bỏ qua chunk đã có)",
@@ -906,6 +915,7 @@ class App:
             output_template=self.var_schema.get().strip(),
             max_json_retries=int(self.var_retries.get()),
             resume=resume,
+            concurrency=int(self.var_parallel.get()),
             router=router,
             on_log=self.log,
             on_progress=self.update_progress,
