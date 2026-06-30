@@ -14,8 +14,20 @@ import time
 from typing import Callable, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
-_SESSION = requests.Session()
+
+def _make_session() -> requests.Session:
+    """Roomy connection pool: online runs fan many concurrent chunks across
+    several hosts, so keep plenty of keep-alive sockets per host (default is 10)."""
+    s = requests.Session()
+    adapter = HTTPAdapter(pool_connections=16, pool_maxsize=64)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+
+_SESSION = _make_session()
 
 _DEFAULT_MAX_RETRIES = 1
 _DEFAULT_RETRY_BACKOFF = 1.5
