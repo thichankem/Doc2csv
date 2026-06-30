@@ -5,11 +5,20 @@ where `output` is always a canonical JSON string. Optimized for fast iterative
 testing: native Ollama JSON grammar, model kept in VRAM via keep_alive,
 output length capped via num_predict.
 """
+import itertools
 import json
+import queue
 import re
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
+
+# Sentinel pushed onto the producer→consumer queue to signal "no more chunks".
+_QUEUE_DONE = object()
+# Sentinel for an empty work stream when peeking the first item.
+_EMPTY = object()
 
 from .csv_writer import AlpacaCSVWriter
 from .extractors.docx_extractor import extract_doc_legacy, extract_docx
@@ -201,6 +210,7 @@ class Pipeline:
         output_template: str = "",
         max_json_retries: int = 1,
         resume: bool = False,
+        concurrency: int = 1,
         router: Optional[object] = None,
         on_log: Optional[Callable[[str], None]] = None,
         on_progress: Optional[Callable[[int, int, Optional[float]], None]] = None,
@@ -220,6 +230,10 @@ class Pipeline:
         self.vision_model = (vision_model or "").strip()
         self.max_json_retries = max(0, int(max_json_retries))
         self.resume = bool(resume)
+        # >1 fans chunks out across threads. The big win is online/mix mode where
+        # the router hands each thread a different endpoint; a single local Ollama
+        # serialises on the GPU so concurrency there mostly just fills its queue.
+        self.concurrency = max(1, int(concurrency))
         # Optional LLMRouter (online/mix). When None, the classic single local
         # Ollama model path is used (self.model + module-level generate()).
         self.router = router
@@ -228,6 +242,10 @@ class Pipeline:
         self.on_status = on_status or (lambda s: None)
         self.should_stop = should_stop or (lambda: False)
         self._durations: list[float] = []
+        # Streaming progress counters (set per run): chunks the producer has
+        # enqueued, and chunks finalized by the consumer.
+        self._discovered = 0
+        self._n_done = 0
 
         # Schema cho Structured Outputs (Ollama ≥ 0.5).
         self.output_template = (output_template or "").strip()
@@ -280,33 +298,72 @@ class Pipeline:
             should_stop=self.should_stop,
         )
 
+    def _read_and_chunk(self, f: str, is_img: bool) -> tuple[int, list[str]]:
+        """Extract one file's text and split it into chunks. Returns (word_count,
+        chunks); (0, []) when empty. Pure enough to run in a worker thread for
+        non-image files (chunk_text is pure); images still call the vision model."""
+        text = self._extract(f, is_img)
+        wc = count_words(text)
+        if wc == 0:
+            return 0, []
+        return wc, chunk_text(text, target_words=self.chunk_words)
+
+    def _iter_files_chunks(self):
+        """Yield (source_name, [chunks]) per file, in input order.
+
+        Non-image files are extracted+chunked on a small read-ahead thread pool
+        (PDF/DOCX parsing is IO/CPU bound and releases the GIL), so later files
+        are already being read while earlier ones are yielded. Images stay serial
+        (shared single-GPU vision model). Emission order matches input order, so
+        chunk ids are stable no matter which read finished first."""
+        files = self.files
+        n = len(files)
+        readahead = min(8, n) or 1
+        pool = ThreadPoolExecutor(max_workers=readahead)
+        futs: dict[int, object] = {}
+        next_submit = 0
+
+        def prime(upto: int) -> None:
+            nonlocal next_submit
+            while next_submit < n and next_submit <= upto:
+                j = next_submit
+                if Path(files[j]).suffix.lower() not in IMAGE_EXTS:
+                    futs[j] = pool.submit(self._read_and_chunk, files[j], False)
+                next_submit += 1
+
+        try:
+            for i, f in enumerate(files):
+                if self.should_stop():
+                    return
+                prime(i + readahead)  # keep reads running ahead of emission
+                name = Path(f).name
+                try:
+                    if i in futs:
+                        self._log(f"📄 {f}")
+                        wc, chunks = futs.pop(i).result()
+                    else:  # image → OCR now (serial)
+                        self._status(f"🖼 Đọc ảnh (OCR): {name}")
+                        self._log(f"🖼 {f}")
+                        wc, chunks = self._read_and_chunk(f, is_img=True)
+                    if not chunks:
+                        self._log(f"   ⚠ {name}: rỗng, bỏ qua")
+                        continue
+                    self._log(f"   {name}: {wc:,} từ → {len(chunks)} chunks")
+                    yield name, chunks
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"   ❌ {e}")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     def _build_chunks(self) -> list[tuple[str, int, str]]:
+        """Materialise every chunk as (source, chunk_id, text). chunk_id is a
+        global running counter in input-file order (stable for resume)."""
         all_chunks: list[tuple[str, int, str]] = []
         gid = 0
-        for f in self.files:
-            if self.should_stop():
-                return all_chunks
-            try:
-                is_img = Path(f).suffix.lower() in IMAGE_EXTS
-                if is_img:
-                    self._status(f"🖼 Đọc ảnh (OCR): {Path(f).name}")
-                    self._log(f"🖼 {f}")
-                else:
-                    self._status(f"Đang đọc: {Path(f).name}")
-                    self._log(f"📄 {f}")
-                text = self._extract(f, is_img)
-                wc = count_words(text)
-                if wc == 0:
-                    self._log("   ⚠ rỗng, bỏ qua")
-                    continue
-                chunks = chunk_text(text, target_words=self.chunk_words)
-                self._log(f"   {wc:,} từ → {len(chunks)} chunks")
-                src = Path(f).name
-                for c in chunks:
-                    all_chunks.append((src, gid, c))
-                    gid += 1
-            except Exception as e:
-                self._log(f"   ❌ {e}")
+        for src, chunks in self._iter_files_chunks():
+            for c in chunks:
+                all_chunks.append((src, gid, c))
+                gid += 1
         return all_chunks
 
     def _call_llm(
@@ -415,6 +472,154 @@ class Pipeline:
             self._log(f"   ⚠ Không đọc được file resume: {e}")
         return done
 
+    def _process_chunk(self, item, schema_block) -> dict:
+        """Run the LLM for one chunk (no I/O). Safe to call from a worker thread:
+        it only reads shared state and calls the (thread-safe) backend."""
+        i, src, cid, chunk = item
+        t0 = time.time()
+        res = {"i": i, "src": src, "cid": cid, "chunk": chunk,
+               "output": "", "ok": False, "elapsed": 0.0,
+               "backend": None, "error": None}
+        try:
+            prompt = PROMPT_TEMPLATE.format(
+                instruction=self.instruction, schema_block=schema_block, chunk=chunk,
+            )
+            # Total is the count discovered so far by the producer (it runs ahead
+            # of consumption), good enough for the "i/total" status line.
+            output, ok = self._generate_chunk_json(prompt, i, max(self._discovered, i))
+            res["output"], res["ok"] = output, ok
+            if self.router is not None:
+                res["backend"] = self.router.last_backend
+        except Exception as e:  # noqa: BLE001 - surfaced to the writer thread
+            res["error"] = str(e)
+        res["elapsed"] = time.time() - t0
+        return res
+
+    def _commit_result(self, res, writer, stats) -> None:
+        """Write one chunk's result + update stats/logs. Runs on one thread only
+        (the main/writer thread) so the CSV writer and stats need no locking."""
+        i = res["i"]
+        # Don't persist a chunk that was cut short by Stop: a partial/raw row
+        # would otherwise be treated as "done" and skipped on the next resume.
+        if self.should_stop() and not res["ok"]:
+            return
+        total = max(self._discovered, self._n_done + 1)
+        if res["error"] is not None:
+            stats["errors"] += 1
+            self._log(f"   ❌ {i}/{total}: {res['error']}")
+        else:
+            if not res["ok"]:
+                stats["raw_fallbacks"] += 1
+            n = writer.write_samples(
+                [{"instruction": self.instruction, "input": res["chunk"], "output": res["output"]}],
+                res["src"], res["cid"],
+            )
+            stats["samples"] += n
+            flag = "" if res["ok"] else " ⚠ raw"
+            bk = f" · {res['backend']}" if res["backend"] else ""
+            self._log(
+                f"   ✓ {i}/{total}: {res['elapsed']:.1f}s · "
+                f"{len(res['output'])} ký tự JSON{flag}{bk}"
+            )
+            stats["chunks"] += 1
+        self._n_done += 1
+        # ETA: wall time per chunk overstates throughput by ~concurrency when
+        # several run at once, so scale it down to reflect real pace.
+        self._record(self._n_done, max(self._discovered, self._n_done),
+                     res["elapsed"] / self.concurrency)
+
+    def _put(self, out_q: "queue.Queue", item) -> bool:
+        """Block until `item` is enqueued, bailing out promptly if Stop is hit
+        (so the producer never deadlocks on a full queue after a stop)."""
+        while True:
+            if self.should_stop():
+                return False
+            try:
+                out_q.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+
+    def _produce(self, out_q: "queue.Queue") -> None:
+        """Background thread: read+chunk files and stream chunks onto the queue so
+        the LLM consumer can start before all files are read. `self._discovered`
+        runs ahead of consumption → meaningful ETA. Always ends with a sentinel."""
+        try:
+            for src, chunks in self._iter_files_chunks():
+                for c in chunks:
+                    if not self._put(out_q, (src, c)):
+                        return
+                    self._discovered += 1
+        finally:
+            # Sentinel must ALWAYS reach the consumer or it would block on get()
+            # forever — so deliver it unconditionally (run() drains to unblock us
+            # if the consumer already stopped reading).
+            out_q.put(_QUEUE_DONE)
+
+    def _drain_join(self, producer: threading.Thread, out_q: "queue.Queue") -> None:
+        """Let the producer finish: pull anything left (so a producer blocked on a
+        full queue after Stop can enqueue its sentinel and exit), then join."""
+        while producer.is_alive():
+            try:
+                out_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+        producer.join(timeout=2.0)
+
+    def _work_items(self, out_q: "queue.Queue", done_keys: set, stats: dict):
+        """Pull (src, chunk) off the queue, assign the global chunk id, drop
+        resume-skipped ones, and yield (i, src, cid, chunk) for processing."""
+        gid = 0
+        while True:
+            item = out_q.get()
+            if item is _QUEUE_DONE:
+                return
+            src, chunk = item
+            cid = gid
+            gid += 1
+            if done_keys and (src, str(cid)) in done_keys:
+                stats["skipped"] += 1
+                self._n_done += 1
+                self.on_progress(self._n_done, max(self._discovered, self._n_done), None)
+                continue
+            yield (cid + 1, src, cid, chunk)
+
+    def _run_stream(self, items, writer, schema_block, stats) -> None:
+        """Consume work items, serially or across a thread pool. Commits (CSV +
+        stats) always happen here on the single calling thread → no locks."""
+        items = iter(items)
+        if self.concurrency <= 1:
+            for it in items:
+                if self.should_stop():
+                    self._log(f"⏹ Dừng ở chunk {it[0]}.")
+                    break
+                self._commit_result(self._process_chunk(it, schema_block), writer, stats)
+            return
+
+        self._log(f"   ⚡ Song song: {self.concurrency} chunk cùng lúc")
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            # Keep at most `concurrency` chunks in flight: prime the window, then
+            # refill one-for-one as each finishes. On stop we quit refilling and
+            # let the in-flight few drain (their workers short-circuit too).
+            futures = set()
+            for _ in range(self.concurrency):
+                nxt = next(items, None)
+                if nxt is None:
+                    break
+                futures.add(pool.submit(self._process_chunk, nxt, schema_block))
+            while futures:
+                completed, futures = wait(futures, return_when=FIRST_COMPLETED)
+                for fut in completed:
+                    self._commit_result(fut.result(), writer, stats)
+                if not self.should_stop():
+                    for _ in range(len(completed)):
+                        nxt = next(items, None)
+                        if nxt is None:
+                            break
+                        futures.add(pool.submit(self._process_chunk, nxt, schema_block))
+        if self.should_stop():
+            self._log(f"⏹ Dừng ({self._n_done} chunk đã xử lý).")
+
     def run(self) -> dict:
         stats = {
             "files": len(self.files), "chunks": 0, "samples": 0,
@@ -441,12 +646,9 @@ class Pipeline:
             else:
                 self._log("   ⚠ Không preload được (sẽ load khi gọi chunk 1)")
 
-        all_chunks = self._build_chunks()
-        total = len(all_chunks)
-        if total == 0:
-            self._log("Không có chunk nào.")
-            self._status("Không có chunk.")
-            return stats
+        self._discovered = 0
+        self._n_done = 0
+        self._durations = []
 
         preview = self.instruction[:120] + ("..." if len(self.instruction) > 120 else "")
         mode = "STRUCTURED (JSON Schema)" if self.json_schema else "JSON loose"
@@ -464,14 +666,13 @@ class Pipeline:
             self._log(
                 "   ⚠ Schema mẫu không parse được JSON — sẽ chạy JSON loose mode."
             )
-        self._log(f"   Chunks: {total}")
         if self.max_json_retries:
             self._log(f"   Retry JSON: tối đa {self.max_json_retries} lần/chunk khi output chưa đạt")
         done_keys = self._load_done_keys()
         if done_keys:
             self._log(f"   ⏭ Resume: bỏ qua {len(done_keys)} chunk đã có trong file output")
-        self.on_progress(0, total, None)
-        self._status(f"Đang xử lý 0/{total}...")
+        self.on_progress(0, 0, None)
+        self._status("Đang đọc & xử lý...")
 
         schema_block = (
             _SCHEMA_PREAMBLE.format(template_json=self._template_compact)
@@ -479,40 +680,25 @@ class Pipeline:
             else ""
         )
 
-        with AlpacaCSVWriter(self.output_csv) as writer:
-            for i, (src, cid, chunk) in enumerate(all_chunks, start=1):
-                if self.should_stop():
-                    self._log(f"⏹ Dừng ở chunk {i}/{total}.")
-                    break
-                if done_keys and (src, str(cid)) in done_keys:
-                    stats["skipped"] += 1
-                    self.on_progress(i, total, None)
-                    continue
-                t0 = time.time()
-                try:
-                    prompt = PROMPT_TEMPLATE.format(
-                        instruction=self.instruction,
-                        schema_block=schema_block,
-                        chunk=chunk,
-                    )
-                    output, ok = self._generate_chunk_json(prompt, i, total)
-                    if not ok:
-                        stats["raw_fallbacks"] += 1
-                    n = writer.write_samples(
-                        [{"instruction": self.instruction, "input": chunk, "output": output}],
-                        src,
-                        cid,
-                    )
-                    stats["samples"] += n
-                    elapsed = time.time() - t0
-                    flag = "" if ok else " ⚠ raw"
-                    bk = f" · {self.router.last_backend}" if self.router is not None else ""
-                    self._log(f"   ✓ {i}/{total}: {elapsed:.1f}s · {len(output)} ký tự JSON{flag}{bk}")
-                    stats["chunks"] += 1
-                except Exception as e:
-                    stats["errors"] += 1
-                    self._log(f"   ❌ {i}/{total}: {e}")
-                self._record(i, total, time.time() - t0)
+        # Producer reads+chunks files in the background and streams chunks onto a
+        # bounded queue; the consumer below starts the LLM as soon as the first
+        # chunk lands, so file-reading overlaps generation instead of blocking it.
+        out_q: "queue.Queue" = queue.Queue(maxsize=max(64, self.concurrency * 8))
+        producer = threading.Thread(target=self._produce, args=(out_q,), daemon=True)
+        producer.start()
+
+        gen = self._work_items(out_q, done_keys, stats)
+        first = next(gen, _EMPTY)
+        if first is _EMPTY:
+            self._drain_join(producer, out_q)
+            if self._discovered == 0:
+                self._log("Không có chunk nào.")
+                self._status("Không có chunk.")
+                return stats
+        else:
+            with AlpacaCSVWriter(self.output_csv) as writer:
+                self._run_stream(itertools.chain([first], gen), writer, schema_block, stats)
+            self._drain_join(producer, out_q)
 
         extra = ""
         if stats["raw_fallbacks"]:
