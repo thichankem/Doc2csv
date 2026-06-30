@@ -17,6 +17,22 @@ Phần mềm desktop trích xuất dữ liệu từ file **PDF / DOCX / DOC / TX
   - `num_predict` cap — chặn output dài lê thê
   - HTTP session reuse
   - Preload model trước khi tính chunk → ETA chuẩn ngay từ đầu
+  - **Chạy song song (`Song song: N`)**: xử lý N chunk cùng lúc. Cực mạnh ở chế
+    độ **Online / Mix** — router xoay vòng giao mỗi luồng một endpoint khác nhau
+    nên N model API chạy đồng thời, nhanh gần **N×** (vẫn ghi CSV an toàn, không
+    mất/trùng chunk). Offline (1 GPU) thì Ollama tự nối hàng nên ít lợi hơn.
+  - **Đọc file song song**: nhiều file PDF/DOCX/TXT được trích xuất + chunk đồng
+    thời (tối đa 8 luồng) — giai đoạn "Đang đọc" nhanh hơn hẳn khi thêm cả thư
+    mục. Ảnh (OCR) vẫn tuần tự vì dùng chung 1 GPU vision. Thứ tự chunk_id luôn
+    ổn định theo thứ tự file đầu vào.
+  - **Đọc & xử lý gối đầu (streaming)**: file được đọc ở luồng nền và đẩy chunk
+    sang LLM ngay khi có — LLM bắt đầu chạy chunk của file trước trong khi vẫn
+    đang đọc các file sau. Bỏ luôn thời gian chờ đọc (read overlap generation).
+  - **Nén ảnh trước OCR**: ảnh quá khổ được hạ về cạnh dài ≤2048px + nén JPEG
+    trước khi gửi vision model → ít token/băng thông, OCR nhanh hơn rõ (chữ tài
+    liệu vẫn đủ nét). Cần `Pillow` (đã có trong `requirements.txt`).
+  - **Connection pool lớn (64)**: giữ nhiều socket keep-alive nên chạy `Song
+    song` cao không bị nghẽn ở giới hạn 10 kết nối mặc định của thư viện HTTP.
 - Streaming token + sub-status realtime
 - **ETA prediction**: rolling 5-chunk average
 - **System monitor**: CPU / RAM / GPU / VRAM realtime (NVIDIA NVML)
@@ -72,6 +88,27 @@ pip install -r requirements.txt
 ```
 
 Trên Windows, gói `pywin32` sẽ được cài tự động để hỗ trợ file `.doc` cũ qua Microsoft Word COM.
+
+---
+
+## Đóng gói thành file .exe (chạy không cần Python)
+
+Muốn một file chạy trực tiếp, không cần cài Python trên máy đích?
+
+```cmd
+build_exe.bat
+```
+
+Script tự cài `pyinstaller` + thư viện rồi build theo `Doc2CSV-AI.spec`. Kết quả:
+**`dist\Doc2CSV-AI.exe`** — một file duy nhất, double-click là chạy (đã kèm icon,
+không hiện cửa sổ console).
+
+> Mẹo: build trong một virtualenv sạch (chỉ cài `requirements.txt`) để .exe gọn
+> nhẹ — `build_exe.bat` ưu tiên dùng `.venv` của dự án nếu có.
+>
+> Nếu chạy **Online / Mix**: đặt file `providers.json` cùng thư mục với `.exe`
+> (hoặc bấm **➕ Chọn provider** trong app để tạo). File `.doc` cũ vẫn cần
+> Microsoft Word; đọc ảnh vẫn cần Ollama + model vision.
 
 ---
 
@@ -131,6 +168,8 @@ python app.py
    - **num_ctx**: context window (4096 đủ cho chunk 200 từ)
    - **keep_alive**: thời gian giữ model trong VRAM (30m mặc định — tăng nếu test liên tục)
    - **Retry JSON**: số lần gọi lại model nếu output chưa đạt JSON/schema (mặc định 1)
+   - **Song song**: số chunk xử lý cùng lúc (mặc định 1). Đặt = số model API đang
+     xoay vòng để chạy Online/Mix nhanh gần N× — xem mục Tốc độ tối ưu
    - **Resume**: tick để ghi tiếp vào file output đã chọn và bỏ qua chunk đã làm
      (khi bật, app **không** thêm timestamp vào tên file để tìm lại được chunk cũ)
 5. Bấm **▶ Bắt đầu trích xuất**
