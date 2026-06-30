@@ -2,9 +2,15 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv-build/
 venv/
 env/
 .env
+
+# PyInstaller build output (keep Doc2CSV-AI.spec + build_exe.bat in git)
+build/
+dist/
+*.exe
 
 output/
 *.csv
