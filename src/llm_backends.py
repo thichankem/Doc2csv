@@ -11,6 +11,7 @@ the router moves to the next one — so a long extraction run keeps going across
 free-tier limits instead of stalling. This is what enables "full online" and
 "mix" modes to run continuously.
 """
+import threading
 import time
 from typing import Callable, Optional
 
@@ -96,7 +97,14 @@ class OpenAIBackend(Backend):
 
 
 class LLMRouter:
-    """Round-robin pool of backends with per-backend cooldown on failure."""
+    """Round-robin pool of backends with per-backend cooldown on failure.
+
+    Thread-safe: the cursor + cooldown table are guarded by a lock and a backend
+    is *claimed* (cursor advanced) before its slow network call runs, so several
+    threads calling :meth:`generate` concurrently each grab a distinct backend.
+    This is what lets the pipeline fan chunks out across many online endpoints at
+    once instead of one-at-a-time.
+    """
 
     def __init__(
         self,
@@ -115,6 +123,7 @@ class LLMRouter:
         self.wait_cap = wait_cap
         self._i = 0
         self._cool: dict[str, float] = {}
+        self._lock = threading.Lock()
         self.last_backend: Optional[str] = None
 
     def __len__(self) -> int:
@@ -137,44 +146,67 @@ class LLMRouter:
                 return
             time.sleep(0.2)
 
+    def _claim(self, exclude: set) -> tuple:
+        """Atomically reserve the next ready backend, advancing the cursor past
+        it. Returns (backend, None) when one is free, or (None, soonest) where
+        ``soonest`` is the earliest cooldown-expiry among backends that are *not*
+        in ``exclude`` (backends this caller already failed) — i.e. the earliest
+        moment it could be worth waiting for. (None, None) means give up now."""
+        with self._lock:
+            n = len(self.backends)
+            now = time.time()
+            soonest: Optional[float] = None
+            for step in range(n):
+                idx = (self._i + step) % n
+                b = self.backends[idx]
+                until = self._cool.get(b.name, 0.0)
+                if until <= now:
+                    self._i = (idx + 1) % n
+                    return b, None
+                if b.name not in exclude:
+                    soonest = until if soonest is None else min(soonest, until)
+            return None, soonest
+
     def generate(
         self, prompt, *, temperature, num_predict, num_ctx,
         format_json, json_schema, keep_alive, on_token, should_stop,
     ) -> str:
         n = len(self.backends)
         errs: list[str] = []
-        for _cycle in range(self.max_cycles):
-            soonest: Optional[float] = None
-            for step in range(n):
-                idx = (self._i + step) % n
-                b = self.backends[idx]
-                until = self._cool.get(b.name, 0.0)
-                now = time.time()
-                if until > now:
-                    soonest = until if soonest is None else min(soonest, until)
-                    continue
-                if should_stop and should_stop():
-                    return ""
+        failed: set = set()   # backends this call already burned — don't wait on them
+        cycles = 0
+        while True:
+            if should_stop and should_stop():
+                return ""
+            b, soonest = self._claim(failed)
+            if b is not None:
                 try:
                     text = b.generate(
                         prompt, temperature=temperature, num_predict=num_predict,
                         num_ctx=num_ctx, format_json=format_json, json_schema=json_schema,
                         keep_alive=keep_alive, on_token=on_token, should_stop=should_stop,
                     )
-                    self._i = (idx + 1) % n   # advance → next chunk uses next backend
                     self.last_backend = b.name
                     return text
                 except RateLimitError as e:
                     wait = e.retry_after or self.cooldown
-                    self._cool[b.name] = time.time() + wait
+                    with self._lock:
+                        self._cool[b.name] = time.time() + wait
+                    failed.add(b.name)
                     errs.append(f"{b.name}: 429")
                     self.on_log(f"   ⏳ {b.name}: rate-limit (nghỉ {wait:.0f}s) — xoay backend")
                 except Exception as e:  # noqa: BLE001 - any failure → cooldown + rotate
-                    self._cool[b.name] = time.time() + self.cooldown
+                    with self._lock:
+                        self._cool[b.name] = time.time() + self.cooldown
+                    failed.add(b.name)
                     errs.append(f"{b.name}: {e}")
                     self.on_log(f"   ⚠ {b.name}: {e} — xoay backend")
-            # Whole sweep failed. If something is merely cooling, wait it out once.
-            if soonest is not None and not (should_stop and should_stop()):
+                continue
+            # No backend ready right now. Only wait if something is merely cooling
+            # (not one we just burned) and we still have cycles left.
+            if (soonest is not None and cycles < self.max_cycles
+                    and not (should_stop and should_stop())):
+                cycles += 1
                 delay = max(0.0, min(soonest - time.time(), self.wait_cap))
                 if delay > 0:
                     self.on_log(f"   ⏸ Mọi backend đang nghỉ — chờ {delay:.0f}s rồi thử lại")
