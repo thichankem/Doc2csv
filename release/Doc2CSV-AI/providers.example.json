@@ -1,0 +1,48 @@
+{
+  "_help": "Sao chép file này thành providers.json rồi điền API key (free). Mỗi cặp endpoint×model là 1 backend trong vòng xoay — liệt kê nhiều model free để chạy được lâu hơn trước khi dính rate-limit. api_key có thể là chuỗi thật hoặc 'env:TEN_BIEN' để đọc từ biến môi trường.",
+
+  "endpoints": [
+    {
+      "name": "openrouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key": "env:OPENROUTER_API_KEY",
+      "enabled": true,
+      "structured": false,
+      "headers": { "HTTP-Referer": "https://localhost", "X-Title": "Doc2CSV-AI" },
+      "models": [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemma-2-9b-it:free",
+        "qwen/qwen-2.5-72b-instruct:free",
+        "mistralai/mistral-small-3.1-24b-instruct:free"
+      ]
+    },
+    {
+      "name": "groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key": "env:GROQ_API_KEY",
+      "enabled": false,
+      "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    },
+    {
+      "name": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "api_key": "env:GEMINI_API_KEY",
+      "enabled": false,
+      "models": ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
+    },
+    {
+      "name": "cerebras",
+      "base_url": "https://api.cerebras.ai/v1",
+      "api_key": "env:CEREBRAS_API_KEY",
+      "enabled": false,
+      "models": ["llama-3.3-70b"]
+    },
+    {
+      "name": "mistral",
+      "base_url": "https://api.mistral.ai/v1",
+      "api_key": "env:MISTRAL_API_KEY",
+      "enabled": false,
+      "models": ["mistral-small-latest"]
+    }
+  ]
+}
