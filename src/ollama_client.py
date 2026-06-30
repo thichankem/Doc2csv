@@ -4,9 +4,22 @@ import time
 from typing import Callable, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
 DEFAULT_BASE = "http://localhost:11434"
-_SESSION = requests.Session()
+
+
+def _make_session() -> requests.Session:
+    """Session with a roomy connection pool so high `concurrency` keeps reusing
+    keep-alive sockets instead of thrashing (requests defaults to only 10)."""
+    s = requests.Session()
+    adapter = HTTPAdapter(pool_connections=16, pool_maxsize=64)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+
+_SESSION = _make_session()
 
 # Default retry policy for transient connection failures. A long run can issue
 # hundreds of calls; a single dropped connection should not abort the batch.
