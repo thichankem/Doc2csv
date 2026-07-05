@@ -1,0 +1,25 @@
+============================================================
+  Doc2CSV-AI - Huong dan chay
+============================================================
+
+CACH CHAY:
+  1. Double-click vao "Doc2CSV-AI.exe" la chay luon.
+  2. Khong can cai Python hay bat cu thu gi.
+
+LAN DAU MO BI WINDOWS CANH BAO?
+  - Neu Windows hien "Windows protected your PC / Unknown publisher":
+    bam "More info" -> "Run anyway". Day la binh thuong voi app tu build
+    (chua mua chu ky so), khong phai virus.
+
+YEU CAU MAY DICH:
+  - Windows 64-bit. Khong can cai dat gi them.
+
+=== CHI KHI DUNG CHE DO ONLINE / MIX (goi LLM tren mang) ===
+  1. Doi ten file "providers.example.json" thanh "providers.json".
+  2. Mo bang Notepad, dien API key (free) vao endpoint ban muon dung,
+     va doi "enabled": false thanh true cho endpoint do.
+  3. De file "providers.json" CUNG THU MUC voi Doc2CSV-AI.exe.
+
+  Neu chi chay model local bang Ollama thi KHONG can file providers.json
+  (nhung may do phai cai san Ollama).
+============================================================
